@@ -2,8 +2,6 @@
 
 **Detect anomalies in astronomical images using embeddings and PCA**
 
-![Project Version](https://img.shields.io/badge/version-0.1.0-blue)
-
 ## 🎯 Overview
 
 Anomaly Reaper is a specialized tool for detecting unusual patterns and anomalies in astronomical imagery data. By leveraging embedding models and Principal Component Analysis (PCA), it can identify outlier patterns that may represent interesting astronomical phenomena or artifacts in TESS (Transiting Exoplanet Survey Satellite) imagery.
