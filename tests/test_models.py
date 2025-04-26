@@ -9,9 +9,12 @@ import datetime
 import uuid
 from sqlalchemy.exc import IntegrityError
 
-from anomaly_reaper.models import (
+from anomaly_reaper.infrastructure.database.models import (
     ImageRecord,
     Classification,
+)
+
+from anomaly_reaper.schemas import (
     ImageResponse,
     ClassificationRequest,
     ClassificationResponse,
@@ -46,7 +49,7 @@ class TestSQLAlchemyModels:
         assert saved_image.is_anomaly is False
         assert saved_image.anomaly_score == 0.8
         assert saved_image.path == "/path/to/test.jpg"
-        assert isinstance(saved_image.timestamp, datetime.datetime)
+        assert isinstance(saved_image.processed_at, datetime.datetime)
 
     def test_classification_creation(self, db_session):
         """Test creating a Classification in the database."""

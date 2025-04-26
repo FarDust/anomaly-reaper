@@ -64,7 +64,7 @@ def version():
 
     try:
         version = get_version("anomaly-reaper")
-    except:
+    except:  # noqa: E722
         version = "0.1.0"  # Default if not installed as package
 
     logger.info(f"{settings.app_name} version: {version}")

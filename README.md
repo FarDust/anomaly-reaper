@@ -47,7 +47,26 @@ Anomaly Reaper is a specialized tool for detecting unusual patterns and anomalie
 
 The API will be available at http://localhost:8000.
 
-> **Note:** The project uses Google Application Default Credentials for authentication. Make sure you have them configured on your system. You can set them up by running `gcloud auth application-default login` if you have the Google Cloud SDK installed.
+### Authentication & Credentials
+
+For Google Cloud services (Vertex AI and Cloud Storage), Anomaly Reaper uses secure authentication methods:
+
+- **GCP Environment (Cloud Run, GKE, etc.)**: No action required. The application automatically uses the instance's service account credentials.
+
+- **Local Development**:
+  ```bash
+  # Authenticate with your Google account
+  gcloud auth application-default login
+  ```
+  
+- **Docker Deployment**: Mount your credentials instead of embedding them:
+  ```bash
+  # In docker-compose.yml (already configured)
+  volumes:
+    - ${GOOGLE_APPLICATION_CREDENTIALS:-~/.config/gcloud/application_default_credentials.json}:/app/google-credentials.json:ro
+  ```
+
+> **⚠️ Security Note**: Never commit credential files (.json) to version control. Don't hardcode keys or secrets in the application code. The application is configured to use environment variables and safe credential mounting.
 
 ## 📊 How It Works
 

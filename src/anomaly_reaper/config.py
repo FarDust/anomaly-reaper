@@ -89,6 +89,16 @@ class Settings(BaseSettings):
         Google Cloud Project ID
     location : str
         Google Cloud region
+    gcs_bucket_name : str, optional
+        Google Cloud Storage bucket name
+    gcs_images_prefix : str
+        Prefix for image storage path in GCS bucket
+    gcs_use_public_urls : bool
+        Whether to use public URLs for GCS images
+    gcp_service_account_path : str, optional
+        Path to GCP service account credentials file
+    use_cloud_storage : bool
+        Whether to use GCS for image storage instead of local files
 
     Examples
     --------
@@ -125,7 +135,7 @@ class Settings(BaseSettings):
     )
     uploads_dir: str = Field(
         default_factory=lambda: os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "uploads"
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "images"
         ),
         description="Directory for uploaded images",
     )
@@ -149,6 +159,23 @@ class Settings(BaseSettings):
     # Google Cloud / VertexAI configuration
     project_id: Optional[str] = Field(None, description="Google Cloud Project ID")
     location: str = Field("us-central1", description="Google Cloud region")
+
+    # Google Cloud Storage configuration
+    gcs_bucket_name: Optional[str] = Field(
+        None, description="Google Cloud Storage bucket name"
+    )
+    gcs_images_prefix: str = Field(
+        "anomaly_reaper/images", description="Prefix path for images in the GCS bucket"
+    )
+    gcs_use_public_urls: bool = Field(
+        True, description="Use public URLs for GCS images"
+    )
+    gcp_service_account_path: Optional[str] = Field(
+        None, description="Path to GCP service account key file"
+    )
+    use_cloud_storage: bool = Field(
+        False, description="Use GCS for image storage instead of local files"
+    )
 
     @field_validator("log_level")
     def validate_log_level(cls, v: str) -> str:

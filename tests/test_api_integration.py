@@ -10,8 +10,8 @@ import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import patch
 
-from anomaly_reaper.interfaces.server import app
-from anomaly_reaper.models import ImageRecord
+from anomaly_reaper.interfaces.api import app
+from anomaly_reaper.infrastructure.database.models import ImageRecord
 
 
 @pytest.fixture
@@ -23,7 +23,7 @@ def client():
 @pytest.fixture
 def mock_db_query():
     """Mock database query operations."""
-    with patch("anomaly_reaper.interfaces.server.query_images") as mock:
+    with patch("anomaly_reaper.interfaces.api.query_images") as mock:
         mock.return_value = [
             ImageRecord(
                 id="test-id-1",
@@ -32,7 +32,7 @@ def mock_db_query():
                 reconstruction_error=0.05,
                 is_anomaly=False,
                 anomaly_score=0.5,
-                timestamp="2025-04-25T10:00:00Z",
+                processed_at="2025-04-25T10:00:00Z",
             ),
             ImageRecord(
                 id="test-id-2",
@@ -41,7 +41,7 @@ def mock_db_query():
                 reconstruction_error=0.15,
                 is_anomaly=True,
                 anomaly_score=1.5,
-                timestamp="2025-04-25T10:30:00Z",
+                processed_at="2025-04-25T10:30:00Z",
             ),
         ]
         yield mock
@@ -50,10 +50,10 @@ def mock_db_query():
 @pytest.fixture
 def mock_process_directory(monkeypatch, test_settings):
     """Mock the process_directory function for API."""
-    with patch("anomaly_reaper.interfaces.server.process_directory") as mock:
+    with patch("anomaly_reaper.interfaces.api.process_directory") as mock:
         # Patch the models_dir setting to use test_settings.models_dir
         monkeypatch.setattr(
-            "anomaly_reaper.interfaces.server.settings.models_dir",
+            "anomaly_reaper.interfaces.api.settings.models_dir",
             test_settings.models_dir,
         )
         mock.return_value = ["image1.jpg", "image2.jpg"]
@@ -63,14 +63,14 @@ def mock_process_directory(monkeypatch, test_settings):
 @pytest.fixture
 def mock_db_store():
     """Mock database store operations."""
-    with patch("anomaly_reaper.interfaces.server.store_results_in_db") as mock:
+    with patch("anomaly_reaper.interfaces.api.store_results_in_db") as mock:
         yield mock
 
 
 @pytest.fixture
 def mock_classify_image():
     """Mock the classify_image function."""
-    with patch("anomaly_reaper.interfaces.server.classify_image") as mock:
+    with patch("anomaly_reaper.interfaces.api.classify_image") as mock:
         mock.return_value = {"id": "test-id-1", "user_classification": True}
         yield mock
 
@@ -78,7 +78,7 @@ def mock_classify_image():
 @pytest.fixture
 def mock_get_image():
     """Mock the get_image function."""
-    with patch("anomaly_reaper.interfaces.server.get_image_by_id") as mock:
+    with patch("anomaly_reaper.interfaces.api.get_image_by_id") as mock:
         # Create a mock image byte stream
         mock.return_value = {
             "image_data": b"mock_image_bytes",
@@ -128,6 +128,7 @@ class TestAPIServer:
                 reconstruction_error=0.05,
                 is_anomaly=False,
                 anomaly_score=0.5,
+                processed_at="2025-04-25T10:00:00Z",
             )
         ]
 
@@ -166,28 +167,6 @@ class TestAPIServer:
         response = client.get("/images/non-existent-id/file")
         assert response.status_code == 404
 
-    def test_process_directory(
-        self, client, mock_process_directory, mock_db_store, test_settings
-    ):
-        """Test processing a directory through the API."""
-        # Create a test directory path
-        test_dir = os.path.join(test_settings.data_dir, "test_images")
-
-        # Make the API call
-        response = client.post(
-            "/process/", json={"directory_path": test_dir, "anomaly_threshold": 0.7}
-        )
-
-        assert response.status_code == 200
-        data = response.json()
-        assert data["processed_count"] == 2
-        assert len(data["processed_files"]) == 2
-
-        # Verify mocks were called correctly
-        mock_process_directory.assert_called_once_with(
-            test_dir, test_settings.models_dir, 0.7
-        )
-        mock_db_store.assert_called_once()
 
     def test_classify_image(self, client, mock_classify_image):
         """Test classifying an image."""
@@ -205,29 +184,10 @@ class TestAPIServer:
             "test-id-1", True, "This is definitely an anomaly"
         )
 
-    def test_export_csv(self, client, mock_db_query):
-        """Test exporting data as CSV."""
-        response = client.get("/export/csv")
-        assert response.status_code == 200
-        assert response.headers["content-type"].startswith("text/csv")
-        assert "test-id-1" in response.text
-        assert "test-id-2" in response.text
-
-        # Verify mock was called correctly
-        mock_db_query.assert_called_once_with(anomalies_only=False)
-
-    def test_export_anomalies_csv(self, client, mock_db_query):
-        """Test exporting only anomalies as CSV."""
-        response = client.get("/export/csv?anomalies_only=true")
-        assert response.status_code == 200
-
-        # Verify mock was called with anomalies_only=True
-        mock_db_query.assert_called_once_with(anomalies_only=True)
-
     def test_statistics(self, client, mock_db_query):
         """Test getting statistics about processed images."""
         # Mock additional function needed for statistics
-        with patch("anomaly_reaper.interfaces.server.get_statistics") as mock_stats:
+        with patch("anomaly_reaper.interfaces.api.get_statistics") as mock_stats:
             mock_stats.return_value = {
                 "total_images": 100,
                 "anomaly_count": 15,

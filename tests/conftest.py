@@ -12,9 +12,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from fastapi.testclient import TestClient
 
-from anomaly_reaper.models import Base
+from anomaly_reaper.infrastructure.database.models import Base
 from anomaly_reaper.config import Settings
-from anomaly_reaper.interfaces.server import app
+from anomaly_reaper.interfaces.api import app
 
 
 # Define mock classes at module level for proper pickling
@@ -137,7 +137,7 @@ def test_image(test_settings):
 def client(test_settings, mock_pca_model, monkeypatch):
     """Create a FastAPI TestClient with mocked settings."""
     # Monkeypatch the app to use test settings
-    from anomaly_reaper.interfaces.server import settings as app_settings
+    from anomaly_reaper.interfaces.api import settings as app_settings
 
     # Override the app settings with test settings
     for key, value in test_settings.model_dump().items():
@@ -155,7 +155,7 @@ def client(test_settings, mock_pca_model, monkeypatch):
         finally:
             db.close()
 
-    from anomaly_reaper.interfaces.server import get_db
+    from anomaly_reaper.interfaces.api import get_db
 
     app.dependency_overrides[get_db] = override_get_db
 

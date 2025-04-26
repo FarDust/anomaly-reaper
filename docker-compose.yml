@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  anomaly-reaper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      # For persistent data and configuration
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./uploads:/app/uploads
+      # Mount Google Cloud credentials for authentication
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-~/.config/gcloud/application_default_credentials.json}:/app/google-credentials.json:ro
+    environment:
+      # Configure application settings
+      - PYTHONPATH=/app
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/google-credentials.json
+      - ANOMALY_REAPER_UPLOADS_DIR=/app/uploads
+      - ANOMALY_REAPER_MODELS_DIR=/app/models
+      - ANOMALY_REAPER_DB_URL=sqlite:////app/data/anomaly_reaper.db
+      # Google Cloud Settings
+      - ANOMALY_REAPER_PROJECT_ID=${GOOGLE_CLOUD_PROJECT}
+      - ANOMALY_REAPER_LOCATION=${GOOGLE_CLOUD_LOCATION:-us-central1}
+      # Google Cloud Storage settings
+      - ANOMALY_REAPER_GCS_BUCKET_NAME=${ANOMALY_REAPER_GCS_BUCKET_NAME}
+      - ANOMALY_REAPER_GCS_IMAGES_PREFIX=anomaly_reaper/images
+      - ANOMALY_REAPER_USE_CLOUD_STORAGE=true
+      - ANOMALY_REAPER_GCS_USE_PUBLIC_URLS=true
+    command: ["run", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info"]
+    restart: unless-stopped
