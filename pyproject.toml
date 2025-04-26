@@ -1,0 +1,55 @@
+[project]
+name = "anomaly-reaper"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "FarDust", email = "gabriel.faundez@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi-mcp>=0.2.0",
+    "langchain-google-vertexai>=2.0.19",
+    "langchain>=0.3.23",
+    "langgraph>=0.3.27",
+    "mcp[cli]>=1.6.0",
+    "pydantic>=2.11.3",
+    "pydantic-settings>=2.0.0",
+    "typer>=0.15.2",
+    "sqlalchemy>=2.0.40",
+    "astroquery>=0.4.10",
+    "fastapi>=0.109.0",
+    "uvicorn>=0.27.0",
+    "python-multipart>=0.0.9",
+    "numpy>=1.26.0",
+    "joblib>=1.3.2",
+    "scikit-image>=0.25.2",
+    "pandas>=2.2.3",
+    "seaborn>=0.13.2",
+    "plotly>=6.0.1",
+    "pytest>=8.3.5",
+    "pillow>=11.2.1",
+    "tqdm>=4.67.1",
+]
+
+[project.scripts]
+anomaly-reaper = "anomaly_reaper:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "google-cloud-aiplatform>=1.90.0",
+    "ipykernel>=6.29.5",
+    "ipywidgets>=8.1.6",
+    "matplotlib>=3.10.1",
+    "pillow>=11.2.1",
+    "ruff>=0.11.7",
+    "scikit-learn>=1.6.1",
+    "tqdm>=4.67.1",
+]
+test = [
+    "pytest>=8.3.5",
+]
