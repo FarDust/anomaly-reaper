@@ -36,6 +36,22 @@ from anomaly_reaper.schemas import (
     ImageClassificationRequest,
     ImageClassificationResponse,
     SyncAnomalyDataResponse,
+    # Add the new schemas we'll define
+    AdvancedFilterRequest,
+    AdvancedFilterResponse,
+    BatchClassificationRequest,
+    BatchClassificationResponse,
+    DateRangeFilterRequest,
+    AnomalyScoreFilterRequest,
+    ClassificationFilterRequest,
+    DashboardStatsResponse,
+    # Add the new schemas for the additional endpoints
+    ClassificationHistoryResponse,
+    ExportRequest,
+    ExportFormat,
+    SimilarAnomaliesRequest,
+    SimilarAnomaliesResponse,
+    SimilarityResult,
 )
 from anomaly_reaper.utils.gcs_storage import (
     get_gcs_client,
@@ -775,6 +791,632 @@ async def sync_anomaly_data(db: Session = Depends(get_db)) -> SyncAnomalyDataRes
         logger.error(f"Error synchronizing anomaly data: {str(e)}")
         raise HTTPException(
             status_code=500, detail=f"Error synchronizing anomaly data: {str(e)}"
+        )
+
+
+# Advanced filtering endpoint
+@app.post("/images/filter")
+async def filter_images(
+    request: AdvancedFilterRequest, db: Session = Depends(get_db)
+) -> AdvancedFilterResponse:
+    """
+    Advanced filtering of images with multiple criteria.
+    
+    This endpoint allows filtering images by date range, anomaly score, 
+    classification status, and other criteria, with pagination and sorting.
+
+    Parameters
+    ----------
+    request : AdvancedFilterRequest
+        The filtering criteria
+        
+    Returns
+    -------
+    AdvancedFilterResponse
+        Filtered and paginated image records
+    """
+    try:
+        # Start with a base query
+        query = db.query(ImageRecord)
+        
+        # Apply filters
+        if request.is_anomaly is not None:
+            query = query.filter(ImageRecord.is_anomaly == request.is_anomaly)
+            
+        # Date range filter
+        if request.date_range:
+            if request.date_range.start_date:
+                query = query.filter(
+                    ImageRecord.processed_at >= request.date_range.start_date
+                )
+            if request.date_range.end_date:
+                query = query.filter(
+                    ImageRecord.processed_at <= request.date_range.end_date
+                )
+                
+        # Anomaly score filter
+        if request.anomaly_score:
+            if request.anomaly_score.min_score is not None:
+                query = query.filter(
+                    ImageRecord.anomaly_score >= request.anomaly_score.min_score
+                )
+            if request.anomaly_score.max_score is not None:
+                query = query.filter(
+                    ImageRecord.anomaly_score <= request.anomaly_score.max_score
+                )
+        
+        # Classification filters are more complex as they involve joins
+        if request.classification:
+            # User has classified the image
+            if request.classification.is_classified is not None:
+                if request.classification.is_classified:
+                    # Images that have classifications
+                    query = query.join(
+                        Classification, 
+                        ImageRecord.id == Classification.image_id
+                    ).distinct()
+                else:
+                    # Images that don't have classifications
+                    # This requires a subquery to find images without classifications
+                    classified_image_ids = db.query(Classification.image_id).distinct().subquery()
+                    query = query.filter(~ImageRecord.id.in_(classified_image_ids))
+            
+            # Filter by specific user classification (True/False)
+            if request.classification.user_classification is not None and request.classification.is_classified:
+                query = query.join(
+                    Classification, 
+                    ImageRecord.id == Classification.image_id
+                ).filter(
+                    Classification.user_classification == request.classification.user_classification
+                ).distinct()
+        
+        # Count total matching records before pagination
+        total_count = query.count()
+        
+        # Apply sorting
+        if request.sort_by:
+            sort_column = getattr(ImageRecord, request.sort_by, ImageRecord.processed_at)
+            if request.sort_order and request.sort_order.lower() == "asc":
+                query = query.order_by(sort_column.asc())
+            else:
+                query = query.order_by(sort_column.desc())
+        
+        # Apply pagination
+        query = query.offset((request.page - 1) * request.page_size).limit(request.page_size)
+        
+        # Execute query
+        records = query.all()
+        
+        # Calculate total pages
+        total_pages = (total_count + request.page_size - 1) // request.page_size if total_count > 0 else 1
+        
+        # Convert to response objects
+        results = [
+            ImageResponse(
+                id=record.id,
+                filename=record.filename,
+                timestamp=record.processed_at,
+                reconstruction_error=record.reconstruction_error,
+                is_anomaly=record.is_anomaly,
+                anomaly_score=record.anomaly_score,
+                path=record.path,
+            )
+            for record in records
+        ]
+        
+        # Return paginated response
+        return AdvancedFilterResponse(
+            results=results,
+            total_count=total_count,
+            page=request.page,
+            page_size=request.page_size,
+            total_pages=total_pages,
+        )
+    except Exception as e:
+        logger.error(f"Error filtering images: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error filtering images: {str(e)}"
+        )
+
+
+# Batch classify images
+@app.post("/images/batch-classify")
+async def batch_classify_images(
+    request: BatchClassificationRequest, db: Session = Depends(get_db)
+) -> BatchClassificationResponse:
+    """
+    Batch classify multiple images.
+    
+    This endpoint allows classifying multiple images at once with the same classification
+    and optional comment.
+
+    Parameters
+    ----------
+    request : BatchClassificationRequest
+        The batch classification request containing image IDs, classification, and optional comment
+        
+    Returns
+    -------
+    BatchClassificationResponse
+        Summary of batch classification results
+    """
+    try:
+        successful = 0
+        failed_ids = []
+        
+        # Process each image ID
+        for image_id in request.image_ids:
+            # Call the existing classify_image function
+            result = classify_image(
+                image_id=image_id,
+                is_anomaly=request.is_anomaly,
+                comment=request.comment
+            )
+            
+            if result:
+                successful += 1
+            else:
+                failed_ids.append(image_id)
+        
+        # Return the results
+        return BatchClassificationResponse(
+            total=len(request.image_ids),
+            successful=successful,
+            failed=len(failed_ids),
+            failed_ids=failed_ids
+        )
+    except Exception as e:
+        logger.error(f"Error batch classifying images: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error batch classifying images: {str(e)}"
+        )
+
+
+# Dashboard statistics endpoint
+@app.get("/dashboard/stats")
+async def dashboard_stats(db: Session = Depends(get_db)) -> DashboardStatsResponse:
+    """
+    Get comprehensive statistics for dashboard visualization.
+    
+    This endpoint provides detailed statistics about anomaly detection results,
+    including model performance metrics based on user feedback.
+
+    Returns
+    -------
+    DashboardStatsResponse
+        Detailed dashboard statistics
+    """
+    try:
+        # Get basic counts
+        total_images = db.query(func.count(ImageRecord.id)).scalar() or 0
+        total_anomalies = db.query(func.count(ImageRecord.id)).filter(
+            ImageRecord.is_anomaly == True  # noqa: E712
+        ).scalar() or 0
+        
+        # Join with classifications to get more advanced metrics
+        # First, get a subquery for the latest classification for each image
+        latest_classifications = (
+            db.query(
+                Classification.image_id,
+                func.max(Classification.timestamp).label("latest_timestamp")
+            )
+            .group_by(Classification.image_id)
+            .subquery()
+        )
+        
+        # Then join with classifications to get the actual latest classifications
+        latest_class_query = (
+            db.query(
+                Classification,
+                ImageRecord.is_anomaly
+            )
+            .join(
+                latest_classifications,
+                (Classification.image_id == latest_classifications.c.image_id) &
+                (Classification.timestamp == latest_classifications.c.latest_timestamp)
+            )
+            .join(
+                ImageRecord,
+                Classification.image_id == ImageRecord.id
+            )
+        )
+        
+        # Get classification counts
+        latest_class_results = latest_class_query.all()
+        
+        # Count user-confirmed anomalies (both model and user agree it's an anomaly)
+        user_confirmed_anomalies = sum(
+            1 for item in latest_class_results
+            if item[0].user_classification is True and item[1] is True
+        )
+        
+        # Count unclassified anomalies (model says anomaly, but no user classification)
+        classified_image_ids = {item[0].image_id for item in latest_class_results}
+        unclassified_anomalies_query = (
+            db.query(ImageRecord)
+            .filter(
+                ImageRecord.is_anomaly == True,  # noqa: E712
+                ~ImageRecord.id.in_(classified_image_ids)
+            )
+        )
+        unclassified_anomalies = unclassified_anomalies_query.count() or 0
+        
+        # Count false positives (model says anomaly, user says normal)
+        false_positives = sum(
+            1 for item in latest_class_results
+            if item[0].user_classification is False and item[1] is True
+        )
+        
+        # Count false negatives (model says normal, user says anomaly)
+        false_negatives = sum(
+            1 for item in latest_class_results
+            if item[0].user_classification is True and item[1] is False
+        )
+        
+        # Get recent activity (limited to last 10)
+        recent_activity_query = (
+            db.query(Classification)
+            .order_by(Classification.timestamp.desc())
+            .limit(10)
+        )
+        recent_activity = [
+            {
+                "timestamp": classification.timestamp,
+                "image_id": classification.image_id,
+                "action": "classification",
+                "is_anomaly": classification.user_classification
+            }
+            for classification in recent_activity_query.all()
+        ]
+        
+        # Return the dashboard statistics
+        return DashboardStatsResponse(
+            total_images=total_images,
+            total_anomalies=total_anomalies,
+            user_confirmed_anomalies=user_confirmed_anomalies,
+            unclassified_anomalies=unclassified_anomalies,
+            false_positives=false_positives,
+            false_negatives=false_negatives,
+            recent_activity=recent_activity
+        )
+    except Exception as e:
+        logger.error(f"Error generating dashboard statistics: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error generating dashboard statistics: {str(e)}"
+        )
+
+
+# Get classification history for an image
+@app.get("/images/{image_id}/classifications")
+async def get_classification_history(
+    image_id: str, db: Session = Depends(get_db)
+) -> ClassificationHistoryResponse:
+    """
+    Get the complete classification history for a specific image.
+    
+    This endpoint returns all user classifications that have been made for a specific image,
+    ordered by timestamp (most recent first).
+    
+    Parameters
+    ----------
+    image_id : str
+        ID of the image to get classifications for
+        
+    Returns
+    -------
+    ClassificationHistoryResponse
+        Classification history for the image
+    """
+    try:
+        # Verify the image exists
+        image = db.query(ImageRecord).filter(ImageRecord.id == image_id).first()
+        if not image:
+            raise HTTPException(
+                status_code=404, detail=f"Image with ID {image_id} not found"
+            )
+            
+        # Get all classifications for this image, ordered by timestamp
+        classifications = (
+            db.query(Classification)
+            .filter(Classification.image_id == image_id)
+            .order_by(Classification.timestamp.desc())
+            .all()
+        )
+        
+        # Convert to response objects
+        classification_responses = [
+            ClassificationResponse(
+                id=classification.id,
+                image_id=classification.image_id,
+                user_classification=classification.user_classification,
+                comment=classification.comment,
+                timestamp=classification.timestamp,
+            )
+            for classification in classifications
+        ]
+        
+        # Return the history
+        return ClassificationHistoryResponse(
+            image_id=image_id,
+            classifications=classification_responses
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving classification history: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error retrieving classification history: {str(e)}"
+        )
+
+
+# Export data in CSV or JSON format
+@app.post("/export")
+async def export_data(
+    request: ExportRequest, db: Session = Depends(get_db)
+) -> FileResponse:
+    """
+    Export anomaly detection data in CSV or JSON format.
+    
+    This endpoint allows exporting filtered data for further analysis or reporting.
+    The export can be filtered using the same criteria as the advanced filter endpoint.
+    
+    Parameters
+    ----------
+    request : ExportRequest
+        Export configuration including format, filters, and options
+        
+    Returns
+    -------
+    FileResponse
+        File containing the exported data
+    """
+    try:
+        # Start with a base query - include all image records
+        query = db.query(ImageRecord)
+        
+        # Apply filters if provided
+        if request.filter:
+            if request.filter.is_anomaly is not None:
+                query = query.filter(ImageRecord.is_anomaly == request.filter.is_anomaly)
+                
+            # Date range filter
+            if request.filter.date_range:
+                if request.filter.date_range.start_date:
+                    query = query.filter(
+                        ImageRecord.processed_at >= request.filter.date_range.start_date
+                    )
+                if request.filter.date_range.end_date:
+                    query = query.filter(
+                        ImageRecord.processed_at <= request.filter.date_range.end_date
+                    )
+                    
+            # Anomaly score filter
+            if request.filter.anomaly_score:
+                if request.filter.anomaly_score.min_score is not None:
+                    query = query.filter(
+                        ImageRecord.anomaly_score >= request.filter.anomaly_score.min_score
+                    )
+                if request.filter.anomaly_score.max_score is not None:
+                    query = query.filter(
+                        ImageRecord.anomaly_score <= request.filter.anomaly_score.max_score
+                    )
+            
+            # Classification filters
+            if request.filter.classification:
+                # User has classified the image
+                if request.filter.classification.is_classified is not None:
+                    if request.filter.classification.is_classified:
+                        # Images that have classifications
+                        query = query.join(
+                            Classification, 
+                            ImageRecord.id == Classification.image_id
+                        ).distinct()
+                    else:
+                        # Images that don't have classifications
+                        classified_image_ids = db.query(Classification.image_id).distinct().subquery()
+                        query = query.filter(~ImageRecord.id.in_(classified_image_ids))
+                
+                # Filter by specific user classification (True/False)
+                if request.filter.classification.user_classification is not None and request.filter.classification.is_classified:
+                    query = query.join(
+                        Classification, 
+                        ImageRecord.id == Classification.image_id
+                    ).filter(
+                        Classification.user_classification == request.filter.classification.user_classification
+                    ).distinct()
+                    
+        # Apply sorting
+        if request.filter and request.filter.sort_by:
+            sort_column = getattr(ImageRecord, request.filter.sort_by, ImageRecord.processed_at)
+            if request.filter.sort_order and request.filter.sort_order.lower() == "asc":
+                query = query.order_by(sort_column.asc())
+            else:
+                query = query.order_by(sort_column.desc())
+        else:
+            # Default sorting by processed_at desc
+            query = query.order_by(ImageRecord.processed_at.desc())
+        
+        # Execute query
+        records = query.all()
+        
+        # Prepare data for export
+        export_data = []
+        for record in records:
+            # Basic image data
+            image_data = {
+                "id": record.id,
+                "filename": record.filename,
+                "processed_at": record.processed_at.isoformat() if record.processed_at else None,
+                "reconstruction_error": record.reconstruction_error,
+                "is_anomaly": record.is_anomaly,
+                "anomaly_score": record.anomaly_score,
+                "path": record.path,
+            }
+            
+            # Include classifications if requested
+            if request.include_classifications:
+                # Get the latest classification for this image
+                latest_classification = (
+                    db.query(Classification)
+                    .filter(Classification.image_id == record.id)
+                    .order_by(Classification.timestamp.desc())
+                    .first()
+                )
+                
+                if latest_classification:
+                    image_data.update({
+                        "user_classification": latest_classification.user_classification,
+                        "user_comment": latest_classification.comment,
+                        "classification_timestamp": latest_classification.timestamp.isoformat() if latest_classification.timestamp else None,
+                    })
+                else:
+                    image_data.update({
+                        "user_classification": None,
+                        "user_comment": None,
+                        "classification_timestamp": None,
+                    })
+            
+            export_data.append(image_data)
+        
+        # Create the export file
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            if request.format == ExportFormat.CSV:
+                # Convert to DataFrame for CSV export
+                df = pd.DataFrame(export_data)
+                df.to_csv(temp_file.name, index=False)
+                media_type = "text/csv"
+                filename = f"anomaly_data_export_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            else:  # Default to JSON
+                # Write as JSON
+                import json
+                with open(temp_file.name, "w") as f:
+                    json.dump(export_data, f, indent=2)
+                media_type = "application/json"
+                filename = f"anomaly_data_export_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            
+            temp_file_path = temp_file.name
+        
+        # Return the file
+        return FileResponse(
+            path=temp_file_path,
+            filename=filename,
+            media_type=media_type,
+        )
+    except Exception as e:
+        logger.error(f"Error exporting data: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error exporting data: {str(e)}"
+        )
+
+
+# Find similar anomalies to a reference image
+@app.post("/images/{image_id}/similar")
+async def find_similar_anomalies(
+    image_id: str, request: SimilarAnomaliesRequest, db: Session = Depends(get_db)
+) -> SimilarAnomaliesResponse:
+    """
+    Find images with similar anomaly patterns to a reference image.
+    
+    This endpoint finds images that exhibit similar anomaly patterns to the
+    specified reference image, using anomaly score and reconstruction error.
+    
+    Parameters
+    ----------
+    image_id : str
+        ID of the reference image to find similar anomalies for
+    request : SimilarAnomaliesRequest
+        Request parameters including limit and minimum similarity score
+        
+    Returns
+    -------
+    SimilarAnomaliesResponse
+        List of similar images with similarity scores
+    """
+    try:
+        # Get the reference image
+        reference_image = db.query(ImageRecord).filter(ImageRecord.id == image_id).first()
+        if not reference_image:
+            raise HTTPException(
+                status_code=404, detail=f"Reference image with ID {image_id} not found"
+            )
+            
+        # Find potential similar images
+        # First, get images with similar anomaly characteristics (score and error)
+        # Focus on images that were detected as anomalies
+        query = (
+            db.query(ImageRecord)
+            .filter(ImageRecord.id != image_id)  # Exclude reference image
+            .filter(ImageRecord.is_anomaly == True)  # Only anomalies
+        )
+        
+        # Get all potential matches
+        potential_matches = query.all()
+        
+        # Calculate similarity scores based on a combination of factors
+        similarity_results = []
+        for image in potential_matches:
+            # Calculate score based on similarity in anomaly score and reconstruction error
+            # Convert to numeric values to ensure we can do math with them
+            ref_score = float(reference_image.anomaly_score) if reference_image.anomaly_score is not None else 0.0
+            img_score = float(image.anomaly_score) if image.anomaly_score is not None else 0.0
+            
+            ref_error = float(reference_image.reconstruction_error) if reference_image.reconstruction_error is not None else 0.0
+            img_error = float(image.reconstruction_error) if image.reconstruction_error is not None else 0.0
+            
+            # Score based on how close these values are (inversely proportional to difference)
+            score_diff = abs(ref_score - img_score)
+            error_diff = abs(ref_error - img_error)
+            
+            # Normalize differences relative to the reference values to get values between 0-1
+            # (where 1 is most similar)
+            max_score_diff = max(ref_score, 1.0)  # Avoid division by zero
+            max_error_diff = max(ref_error, 1.0)  # Avoid division by zero
+            
+            normalized_score_similarity = 1.0 - min(score_diff / max_score_diff, 1.0)
+            normalized_error_similarity = 1.0 - min(error_diff / max_error_diff, 1.0)
+            
+            # Combine the similarity scores (equal weight to both factors)
+            combined_similarity = (normalized_score_similarity + normalized_error_similarity) / 2
+            
+            # Only include if above minimum score threshold
+            if combined_similarity >= request.min_score:
+                similarity_results.append({
+                    "image": image,
+                    "similarity_score": combined_similarity
+                })
+        
+        # Sort by similarity score (highest first) and limit results
+        similarity_results.sort(key=lambda x: x["similarity_score"], reverse=True)
+        limited_results = similarity_results[:request.limit]
+        
+        # Convert to response objects
+        response_results = [
+            SimilarityResult(
+                image=ImageResponse(
+                    id=result["image"].id,
+                    filename=result["image"].filename,
+                    timestamp=result["image"].processed_at,
+                    reconstruction_error=result["image"].reconstruction_error,
+                    is_anomaly=result["image"].is_anomaly,
+                    anomaly_score=result["image"].anomaly_score,
+                    path=result["image"].path,
+                ),
+                similarity_score=result["similarity_score"]
+            )
+            for result in limited_results
+        ]
+        
+        # Return the results
+        return SimilarAnomaliesResponse(
+            reference_image_id=image_id,
+            similar_images=response_results
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error finding similar anomalies: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error finding similar anomalies: {str(e)}"
         )
 
 

@@ -13,6 +13,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv for package management (faster than pip)
@@ -25,7 +26,8 @@ COPY pyproject.toml uv.lock ./
 # Create and activate virtual environment, then install dependencies
 RUN uv venv /app/.venv \
     && . /app/.venv/bin/activate \
-    && uv pip install --system ".[dev,test]"
+    && uv pip install --system ".[dev,test]" \
+    && uv pip install --system "psycopg2-binary"
 
 # Copy source code
 COPY src/ ./src/
