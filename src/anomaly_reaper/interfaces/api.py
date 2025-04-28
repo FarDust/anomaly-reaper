@@ -236,11 +236,23 @@ async def create_image(
     try:
         # Create a unique filename for the uploaded image
         filename = f"{uuid.uuid4()}_{file.filename}"
-
+        local_filepath = os.path.join(settings.uploads_dir, filename)
+        
         # Read the file content
         contents = await file.read()
+        
+        # Always save a local copy regardless of storage settings
+        # This ensures there's always a local backup even when using GCS
+        os.makedirs(os.path.dirname(local_filepath), exist_ok=True)
+        with open(local_filepath, "wb") as f:
+            f.write(contents)
+        
+        logger.info(f"Saved local copy at {local_filepath}")
 
-        # Store the image based on configuration
+        # Determine the path to store in the database
+        filepath = local_filepath
+        
+        # If cloud storage is enabled, also upload to GCS and update the path
         if settings.use_cloud_storage:
             try:
                 # Determine content type based on file extension
@@ -251,44 +263,26 @@ async def create_image(
                     content_type = "image/gif"
                 elif file.filename.lower().endswith((".fits", ".fit")):
                     content_type = "image/fits"
+                elif file.filename.lower().endswith(".webp"):
+                    content_type = "image/webp"
 
                 # Upload to GCS and get the path
-                filepath = upload_image_to_gcs(contents, filename, content_type)
-                logger.info(f"Uploaded image to GCS: {filepath}")
+                gcs_path = upload_image_to_gcs(contents, filename, content_type)
+                logger.info(f"Uploaded image to GCS: {gcs_path}")
 
-                # For processing, we need a local copy temporarily
-                temp_local_path = os.path.join(settings.uploads_dir, filename)
-                with open(temp_local_path, "wb") as f:
-                    f.write(contents)
-
-                # Process the image
-                result = process_image(temp_local_path, settings.models_dir)
-
-                # Clean up the temporary file
-                os.unlink(temp_local_path)
-            except ValueError as e:
-                # Handle missing GCP configuration by falling back to local storage
+                # Update the filepath to the GCS path
+                filepath = gcs_path
+            except Exception as e:
+                # Handle missing GCP configuration by keeping the local path
                 logger.warning(
-                    f"Cloud storage configuration issue: {str(e)}. Falling back to local storage."
+                    f"Could not upload to cloud storage: {str(e)}. Using local storage only."
                 )
+                # Keep using the local path
 
-                # Save locally instead
-                filepath = os.path.join(settings.uploads_dir, filename)
-                with open(filepath, "wb") as f:
-                    f.write(contents)
+        # Process the image - always use the local path for processing
+        result = process_image(local_filepath, settings.models_dir)
 
-                # Process the image
-                result = process_image(filepath, settings.models_dir)
-        else:
-            # Save locally
-            filepath = os.path.join(settings.uploads_dir, filename)
-            with open(filepath, "wb") as f:
-                f.write(contents)
-
-            # Process the image
-            result = process_image(filepath, settings.models_dir)
-
-        # Create record
+        # Create record with the appropriate filepath (GCS or local)
         record = ImageRecord(
             id=str(uuid.uuid4()),
             filename=filename,
@@ -404,7 +398,7 @@ async def search_images(
     sort_by: str = "processed_at",
     sort_order: str = "desc",
     db: Session = Depends(get_db)
-) -> PaginatedImagesResponse:
+) -> AdvancedFilterResponse:
     """
     Search images with filtering criteria.
 
@@ -435,7 +429,7 @@ async def search_images(
 
     Returns
     -------
-    PaginatedImagesResponse
+    AdvancedFilterResponse
         Filtered and paginated image records
     """
     try:
@@ -522,8 +516,8 @@ async def search_images(
             for record in records
         ]
 
-        # Return paginated response
-        return PaginatedImagesResponse(
+        # Return advanced filter response
+        return AdvancedFilterResponse(
             results=results,
             total_count=total_count,
             page=page,
@@ -596,25 +590,52 @@ async def get_image_file(image_id: str) -> FileResponse:
     FileResponse
         The image file
     """
-    image_data = get_image_by_id(image_id)
+    try:
+        logger.info(f"Attempting to retrieve image file for ID: {image_id}")
+        
+        # First, check if the image record exists in the database
+        db = next(get_db())
+        record = db.query(ImageRecord).filter(ImageRecord.id == image_id).first()
+        
+        if not record:
+            logger.error(f"Image record with ID {image_id} not found in database")
+            raise HTTPException(
+                status_code=404, detail=f"Image record with ID {image_id} not found"
+            )
+        
+        logger.info(f"Found image record: path={record.path}")
+        
+        # Get the actual image data using our improved function
+        image_data = get_image_by_id(image_id)
 
-    if not image_data:
-        raise HTTPException(
-            status_code=404, detail=f"Image file with ID {image_id} not found"
+        if not image_data:
+            logger.error(f"Could not retrieve image data for ID {image_id} from path {record.path}")
+            raise HTTPException(
+                status_code=404, detail=f"Image file with ID {image_id} not found or inaccessible"
+            )
+            
+        logger.info(f"Successfully retrieved image data for ID {image_id}, content type: {image_data['content_type']}")
+
+        # Create a temporary file to serve
+        with NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
+            temp_file.write(image_data["image_data"])
+            temp_file_path = temp_file.name
+            
+        logger.info(f"Created temporary file at {temp_file_path}")
+
+        return FileResponse(
+            path=temp_file_path,
+            headers={"Content-Disposition": f"inline; filename={image_id}.jpg"},
+            media_type=image_data["content_type"],
         )
-
-    # Create a temporary file to serve
-    with NamedTemporaryFile(
-        delete=False, suffix=".jpg"
-    ) as temp_file:
-        temp_file.write(image_data["image_data"])
-        temp_file_path = temp_file.name
-
-    return FileResponse(
-        path=temp_file_path,
-        headers={"Content-Disposition": f"inline; filename={image_id}.jpg"},
-        media_type=image_data["content_type"],
-    )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error serving image file: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error serving image file: {str(e)}"
+        )
 
 
 # Classify an image
@@ -660,6 +681,79 @@ async def api_classify_image(
         )
 
 
+# Batch classify multiple images
+@app.patch("/images/classifications", tags=["classifications"])
+async def batch_update_classifications(
+    request: BatchClassificationRequest, db: Session = Depends(get_db)
+) -> BatchClassificationResponse:
+    """
+    Update classifications for multiple images at once.
+
+    Parameters
+    ----------
+    request : BatchClassificationRequest
+        The batch classification request containing image IDs, classification, and optional comment
+
+    Returns
+    -------
+    BatchClassificationResponse
+        Summary of batch classification results
+    """
+    try:
+        image_ids = request.image_ids
+        is_anomaly = request.is_anomaly
+        comment = request.comment
+
+        # Track results
+        successful_count = 0
+        failed_ids = []
+
+        # Process each image ID
+        for image_id in image_ids:
+            try:
+                # Check if the image exists
+                image = db.query(ImageRecord).filter(ImageRecord.id == image_id).first()
+                if not image:
+                    logger.warning(f"Image with ID {image_id} not found")
+                    failed_ids.append(image_id)
+                    continue
+
+                # Create a classification record
+                classification_id = str(uuid.uuid4())
+                classification = Classification(
+                    id=classification_id,
+                    image_id=image_id,
+                    user_classification=is_anomaly,
+                    comment=comment,
+                    timestamp=datetime.datetime.now(datetime.timezone.utc),
+                )
+
+                # Add to database
+                db.add(classification)
+                successful_count += 1
+
+            except Exception as e:
+                logger.error(f"Error classifying image {image_id}: {str(e)}")
+                failed_ids.append(image_id)
+
+        # Commit all successful classifications
+        db.commit()
+
+        # Return the summary
+        return BatchClassificationResponse(
+            total=len(image_ids),
+            successful=successful_count,
+            failed=len(failed_ids),
+            failed_ids=failed_ids,
+        )
+
+    except Exception as e:
+        logger.error(f"Error in batch classification: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error in batch classification: {str(e)}"
+        )
+
+
 # Get statistics about processed images
 @app.get("/statistics", tags=["statistics"])
 async def api_statistics() -> StatisticsResponse:
@@ -681,7 +775,117 @@ async def api_statistics() -> StatisticsResponse:
         )
 
 
-# Get an image by ID
+# Get dashboard statistics
+@app.get("/statistics/dashboard", tags=["statistics"])
+async def get_dashboard_statistics(db: Session = Depends(get_db)) -> DashboardStatsResponse:
+    """
+    Get comprehensive statistics for dashboard visualization.
+
+    Returns
+    -------
+    DashboardStatsResponse
+        Detailed dashboard statistics
+    """
+    try:
+        # Get total number of images
+        total_images = db.query(func.count(ImageRecord.id)).scalar()
+        
+        # Get number of anomalies detected by the model
+        total_anomalies = (
+            db.query(func.count(ImageRecord.id))
+            .filter(ImageRecord.is_anomaly == True)  # noqa: E712
+            .scalar()
+        )
+        
+        # Get number of user-confirmed anomalies
+        # These are images marked as anomalies by the model that users also classified as anomalies
+        user_confirmed_anomalies = (
+            db.query(func.count(ImageRecord.id))
+            .join(Classification, ImageRecord.id == Classification.image_id)
+            .filter(ImageRecord.is_anomaly == True)  # noqa: E712
+            .filter(Classification.user_classification == True)  # noqa: E712
+            .distinct()
+            .scalar()
+        )
+        
+        # Get number of unclassified anomalies
+        # These are images marked as anomalies by the model that have not been classified by users yet
+        # First find all classified image IDs
+        classified_image_ids = db.query(Classification.image_id).distinct().subquery()
+        
+        # Then count anomalous images that aren't in the classified set
+        unclassified_anomalies = (
+            db.query(func.count(ImageRecord.id))
+            .filter(ImageRecord.is_anomaly == True)  # noqa: E712
+            .filter(~ImageRecord.id.in_(classified_image_ids))
+            .scalar()
+        )
+        
+        # Get false positives
+        # These are images marked as anomalies by the model but classified as normal by users
+        false_positives = (
+            db.query(func.count(ImageRecord.id))
+            .join(Classification, ImageRecord.id == Classification.image_id)
+            .filter(ImageRecord.is_anomaly == True)  # noqa: E712
+            .filter(Classification.user_classification == False)  # noqa: E712
+            .distinct()
+            .scalar()
+        )
+        
+        # Get false negatives
+        # These are images marked as normal by the model but classified as anomalies by users
+        false_negatives = (
+            db.query(func.count(ImageRecord.id))
+            .join(Classification, ImageRecord.id == Classification.image_id)
+            .filter(ImageRecord.is_anomaly == False)  # noqa: E712
+            .filter(Classification.user_classification == True)  # noqa: E712
+            .distinct()
+            .scalar()
+        )
+        
+        # Get recent activity (10 most recent classifications)
+        recent_activity_records = (
+            db.query(Classification)
+            .order_by(Classification.timestamp.desc())
+            .limit(10)
+            .all()
+        )
+        
+        # Format the activity for the response
+        recent_activity = []
+        for record in recent_activity_records:
+            # Get the image details
+            image = db.query(ImageRecord).filter(ImageRecord.id == record.image_id).first()
+            
+            activity_item = {
+                "timestamp": record.timestamp,
+                "image_id": record.image_id,
+                "action": "classification",
+                "is_anomaly": record.user_classification,
+                "comment": record.comment,
+                "model_prediction": image.is_anomaly if image else None,
+                "anomaly_score": float(image.anomaly_score) if image and image.anomaly_score is not None else None,
+            }
+            recent_activity.append(activity_item)
+        
+        # Return the dashboard statistics
+        return DashboardStatsResponse(
+            total_images=total_images,
+            total_anomalies=total_anomalies,
+            user_confirmed_anomalies=user_confirmed_anomalies,
+            unclassified_anomalies=unclassified_anomalies,
+            false_positives=false_positives,
+            false_negatives=false_negatives,
+            recent_activity=recent_activity,
+        )
+    except Exception as e:
+        logger.error(f"Error retrieving dashboard statistics: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error retrieving dashboard statistics: {str(e)}"
+        )
+
+
+# Get image by ID
 def get_image_by_id(image_id: str) -> Optional[Dict[str, Any]]:
     """
     Retrieve an image file by its ID.
@@ -702,7 +906,13 @@ def get_image_by_id(image_id: str) -> Optional[Dict[str, Any]]:
         record = db.query(ImageRecord).filter(ImageRecord.id == image_id).first()
 
         if not record or not record.path:
+            logger.error(f"No record found for image ID {image_id} or path is empty")
             return None
+        
+        logger.info(f"Found image record: id={image_id}, path={record.path}")
+
+        # Extract the filename from the path
+        filename = os.path.basename(record.path)
 
         # Check if the path is a GCS path
         if is_gcs_path(record.path):
@@ -713,102 +923,165 @@ def get_image_by_id(image_id: str) -> Optional[Dict[str, Any]]:
                     return {"image_data": image_data, "content_type": content_type}
                 except Exception as e:
                     logger.error(f"Error downloading image from GCS: {str(e)}")
-                    # Try to find a local copy with same filename
-                    filename = os.path.basename(record.path)
-                    local_path = os.path.join(settings.uploads_dir, filename)
-                    if os.path.exists(local_path):
-                        logger.info(f"Found local copy of GCS image at {local_path}")
-                        with open(local_path, "rb") as f:
-                            image_data = f.read()
-
-                        # Determine content type based on file extension
-                        content_type = "image/jpeg"  # Default
-                        if local_path.lower().endswith(".png"):
-                            content_type = "image/png"
-                        elif local_path.lower().endswith(".gif"):
-                            content_type = "image/gif"
-                        elif local_path.lower().endswith((".fits", ".fit")):
-                            content_type = "image/fits"
-
-                        return {"image_data": image_data, "content_type": content_type}
-                    return None
+                    # Continue to fallback mechanisms below
             else:
                 # GCS is disabled but path is GCS - try to find a local copy
                 logger.warning(
                     f"GCS path found ({record.path}) but cloud storage is disabled. Trying to find local copy."
                 )
-                filename = os.path.basename(record.path)
-                local_path = os.path.join(settings.uploads_dir, filename)
+            
+            # Try local fallbacks:
+            
+            # 1. First check in uploads directory
+            local_path = os.path.join(settings.uploads_dir, filename)
+            if os.path.exists(local_path):
+                logger.info(f"Found local copy of GCS image at {local_path}")
+                with open(local_path, "rb") as f:
+                    image_data = f.read()
 
-                if os.path.exists(local_path):
-                    logger.info(f"Found local copy of GCS image at {local_path}")
-                    with open(local_path, "rb") as f:
-                        image_data = f.read()
-
-                    # Determine content type based on file extension
-                    content_type = "image/jpeg"  # Default
-                    if local_path.lower().endswith(".png"):
-                        content_type = "image/png"
-                    elif local_path.lower().endswith(".gif"):
-                        content_type = "image/gif"
-                    elif local_path.lower().endswith((".fits", ".fit")):
-                        content_type = "image/fits"
-
-                    return {"image_data": image_data, "content_type": content_type}
-
-                # If we can't find a local copy, check the original data folder
-                original_image_path = None
-                for root, _, files in os.walk(settings.data_dir):
+                # Determine content type based on file extension
+                content_type = get_content_type_from_filename(local_path)
+                return {"image_data": image_data, "content_type": content_type}
+                
+            # 2. Check in data directory for astronomical images (FITS files, etc.)
+            potential_data_paths = []
+            
+            # Specifically check the data/s0027/cam1-ccd1 directory for TESS images
+            tess_data_dir = os.path.join(settings.data_dir, "s0027", "cam1-ccd1")
+            if os.path.exists(tess_data_dir):
+                for root, _, files in os.walk(tess_data_dir):
                     for file in files:
-                        if file == filename:
-                            original_image_path = os.path.join(root, file)
-                            break
-                    if original_image_path:
-                        break
-
-                if original_image_path and os.path.exists(original_image_path):
-                    logger.info(f"Found original image at {original_image_path}")
-                    with open(original_image_path, "rb") as f:
-                        image_data = f.read()
-
-                    # Determine content type based on file extension
-                    content_type = "image/jpeg"  # Default
-                    if original_image_path.lower().endswith(".png"):
-                        content_type = "image/png"
-                    elif original_image_path.lower().endswith(".gif"):
-                        content_type = "image/gif"
-                    elif original_image_path.lower().endswith((".fits", ".fit")):
-                        content_type = "image/fits"
-
-                    return {"image_data": image_data, "content_type": content_type}
-
-                logger.error(
-                    f"Cannot find local copy for GCS image with path {record.path}"
-                )
-                return None
+                        if filename in file:  # If filename is part of any file in the TESS data directory
+                            potential_data_paths.append(os.path.join(root, file))
+            
+            # 3. Search all of data directory recursively for the exact filename
+            for root, _, files in os.walk(settings.data_dir):
+                if filename in files:
+                    found_path = os.path.join(root, filename)
+                    logger.info(f"Found image in data directory: {found_path}")
+                    potential_data_paths.append(found_path)
+            
+            # Use the first found path
+            if potential_data_paths:
+                found_path = potential_data_paths[0]
+                logger.info(f"Using found image at: {found_path}")
+                with open(found_path, "rb") as f:
+                    image_data = f.read()
+                
+                content_type = get_content_type_from_filename(found_path)
+                return {"image_data": image_data, "content_type": content_type}
+            
+            # 4. If still not found, try to download from the GCS URL directly
+            # even though GCS integration is disabled
+            try:
+                logger.info(f"Attempting to download from GCS URL directly: {record.path}")
+                # Extract bucket and blob path from gs:// URL
+                gcs_path = record.path.replace("gs://", "")
+                parts = gcs_path.split("/", 1)
+                if len(parts) < 2:
+                    logger.error(f"Invalid GCS path format: {record.path}")
+                    return None
+                
+                bucket_name = parts[0]
+                blob_path = parts[1]
+                
+                # Create a public HTTP URL
+                http_url = f"https://storage.googleapis.com/{bucket_name}/{blob_path}"
+                
+                # Download using requests
+                import requests
+                logger.info(f"Attempting to download from public URL: {http_url}")
+                response = requests.get(http_url, timeout=10)
+                
+                if response.status_code == 200:
+                    # Save a local copy for future use
+                    local_save_path = os.path.join(settings.uploads_dir, filename)
+                    os.makedirs(os.path.dirname(local_save_path), exist_ok=True)
+                    
+                    with open(local_save_path, "wb") as f:
+                        f.write(response.content)
+                    
+                    logger.info(f"Successfully downloaded and saved image to {local_save_path}")
+                    return {
+                        "image_data": response.content, 
+                        "content_type": response.headers.get("Content-Type", get_content_type_from_filename(filename))
+                    }
+                else:
+                    logger.error(f"Failed to download from public URL. Status code: {response.status_code}")
+            except Exception as e:
+                logger.error(f"Error downloading from public URL: {str(e)}")
+            
+            logger.error(
+                f"Cannot find local copy for GCS image with path {record.path}"
+            )
+            return None
         else:
-            # Handle local file
+            # Handle local file path
+            # If the path doesn't exist as is, try to find it
             if not os.path.exists(record.path):
-                logger.error(f"Image file not found at path: {record.path}")
+                logger.warning(f"Image file not found at path: {record.path}. Trying alternative locations.")
+                
+                # Try finding the file in uploads directory
+                upload_path = os.path.join(settings.uploads_dir, filename)
+                if os.path.exists(upload_path):
+                    logger.info(f"Found image in uploads directory: {upload_path}")
+                    with open(upload_path, "rb") as f:
+                        image_data = f.read()
+                    content_type = get_content_type_from_filename(upload_path)
+                    return {"image_data": image_data, "content_type": content_type}
+                
+                # Try recursively searching the data directory for the file
+                for root, _, files in os.walk(settings.data_dir):
+                    if filename in files:
+                        found_path = os.path.join(root, filename)
+                        logger.info(f"Found image in data directory: {found_path}")
+                        with open(found_path, "rb") as f:
+                            image_data = f.read()
+                        content_type = get_content_type_from_filename(found_path)
+                        return {"image_data": image_data, "content_type": content_type}
+                
+                logger.error(f"Image file not found in any location: {filename}")
                 return None
 
-            # Read the image file
+            # Read the image file from the original path
             with open(record.path, "rb") as f:
                 image_data = f.read()
 
             # Determine content type based on file extension
-            content_type = "image/jpeg"  # Default
-            if record.path.lower().endswith(".png"):
-                content_type = "image/png"
-            elif record.path.lower().endswith(".gif"):
-                content_type = "image/gif"
-            elif record.path.lower().endswith((".fits", ".fit")):
-                content_type = "image/fits"
-
+            content_type = get_content_type_from_filename(record.path)
             return {"image_data": image_data, "content_type": content_type}
     except Exception as e:
         logger.error(f"Error retrieving image by ID: {str(e)}")
         return None
+
+
+# Helper function to determine content type from filename
+def get_content_type_from_filename(filepath: str) -> str:
+    """
+    Determine content type based on file extension.
+    
+    Parameters
+    ----------
+    filepath : str
+        Path to the file
+        
+    Returns
+    -------
+    str
+        MIME content type for the file
+    """
+    content_type = "application/octet-stream"  # Default
+    if filepath.lower().endswith(".jpg") or filepath.lower().endswith(".jpeg"):
+        content_type = "image/jpeg"
+    elif filepath.lower().endswith(".png"):
+        content_type = "image/png"
+    elif filepath.lower().endswith(".gif"):
+        content_type = "image/gif"
+    elif filepath.lower().endswith((".fits", ".fit")):
+        content_type = "image/fits"
+    elif filepath.lower().endswith(".webp"):
+        content_type = "image/webp"
+    return content_type
 
 
 # Get statistics about processed images
@@ -1458,6 +1731,211 @@ async def create_pca_visualization(
         logger.error(f"Error generating PCA projection: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500, detail=f"Error generating PCA projection: {str(e)}"
+        )
+
+
+# Export image data in CSV or JSON format
+@app.get("/images/export", tags=["export"])
+async def export_images(
+    format: ExportFormat = ExportFormat.JSON,
+    is_anomaly: Optional[bool] = None,
+    start_date: Optional[datetime.datetime] = None,
+    end_date: Optional[datetime.datetime] = None,
+    min_score: Optional[float] = None,
+    max_score: Optional[float] = None,
+    is_classified: Optional[bool] = None,
+    user_classification: Optional[bool] = None,
+    include_classifications: bool = True,
+    sort_by: Optional[str] = None,
+    sort_order: str = "desc",
+    db: Session = Depends(get_db)
+) -> FileResponse:
+    """
+    Export image data in CSV or JSON format with optional filtering.
+
+    Parameters
+    ----------
+    format : ExportFormat
+        Format for export (JSON or CSV)
+    is_anomaly : Optional[bool]
+        Filter by model-detected anomaly status
+    start_date : Optional[datetime]
+        Filter by start date (inclusive)
+    end_date : Optional[datetime]
+        Filter by end date (inclusive)
+    min_score : Optional[float]
+        Minimum anomaly score
+    max_score : Optional[float]
+        Maximum anomaly score
+    is_classified : Optional[bool]
+        Whether the image has been classified by a user
+    user_classification : Optional[bool]
+        Filter by user classification (True for anomaly, False for normal)
+    include_classifications : bool
+        Whether to include classification details in the export
+    sort_by : Optional[str]
+        Field to sort by
+    sort_order : str
+        Sort order ("asc" or "desc")
+
+    Returns
+    -------
+    FileResponse
+        File containing the exported data
+    """
+    try:
+        # Start with a base query
+        query = db.query(ImageRecord)
+
+        # Apply filters
+        if is_anomaly is not None:
+            query = query.filter(ImageRecord.is_anomaly == is_anomaly)
+
+        # Date range filter
+        if start_date:
+            query = query.filter(ImageRecord.processed_at >= start_date)
+        if end_date:
+            query = query.filter(ImageRecord.processed_at <= end_date)
+
+        # Anomaly score filter
+        if min_score is not None:
+            query = query.filter(ImageRecord.anomaly_score >= min_score)
+        if max_score is not None:
+            query = query.filter(ImageRecord.anomaly_score <= max_score)
+
+        # Classification filters
+        if is_classified is not None:
+            if is_classified:
+                # Images that have classifications
+                query = query.join(
+                    Classification, ImageRecord.id == Classification.image_id
+                ).distinct()
+            else:
+                # Images that don't have classifications
+                classified_image_ids = (
+                    db.query(Classification.image_id).distinct().subquery()
+                )
+                query = query.filter(~ImageRecord.id.in_(classified_image_ids))
+
+        # Filter by specific user classification (True/False)
+        if user_classification is not None and is_classified:
+            query = (
+                query.join(
+                    Classification, ImageRecord.id == Classification.image_id
+                )
+                .filter(
+                    Classification.user_classification == user_classification
+                )
+                .distinct()
+            )
+
+        # Apply sorting if specified
+        if sort_by:
+            sort_column = getattr(ImageRecord, sort_by, ImageRecord.processed_at)
+            if sort_order.lower() == "asc":
+                query = query.order_by(sort_column.asc())
+            else:
+                query = query.order_by(sort_column.desc())
+        else:
+            # Default sort by processed_at
+            if sort_order.lower() == "asc":
+                query = query.order_by(ImageRecord.processed_at.asc())
+            else:
+                query = query.order_by(ImageRecord.processed_at.desc())
+
+        # Execute query
+        records = query.all()
+
+        # Prepare data for export
+        export_data = []
+        for record in records:
+            image_data = {
+                "id": record.id,
+                "filename": record.filename,
+                "timestamp": record.processed_at.isoformat(),
+                "reconstruction_error": float(record.reconstruction_error) if record.reconstruction_error is not None else None,
+                "is_anomaly": bool(record.is_anomaly),
+                "anomaly_score": float(record.anomaly_score) if record.anomaly_score is not None else None,
+                "path": record.path,
+            }
+
+            # Include classifications if requested
+            if include_classifications:
+                # Get the most recent classification for this image
+                classification = (
+                    db.query(Classification)
+                    .filter(Classification.image_id == record.id)
+                    .order_by(Classification.timestamp.desc())
+                    .first()
+                )
+
+                if classification:
+                    image_data["user_classified"] = True
+                    image_data["user_classification"] = bool(classification.user_classification)
+                    image_data["classification_comment"] = classification.comment
+                    image_data["classification_timestamp"] = classification.timestamp.isoformat()
+                else:
+                    image_data["user_classified"] = False
+                    image_data["user_classification"] = None
+                    image_data["classification_comment"] = None
+                    image_data["classification_timestamp"] = None
+
+            export_data.append(image_data)
+
+        # Create a file in the requested format
+        current_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        if format == ExportFormat.CSV:
+            import csv
+            
+            # Create a temporary CSV file
+            with tempfile.NamedTemporaryFile(
+                mode="w", delete=False, suffix=".csv", newline=""
+            ) as temp_file:
+                temp_file_path = temp_file.name
+                
+                # Determine field names - use first record as template
+                if export_data:
+                    fieldnames = export_data[0].keys()
+                    writer = csv.DictWriter(temp_file, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(export_data)
+                else:
+                    # No data, just create empty file with headers
+                    fieldnames = ["id", "filename", "timestamp", "reconstruction_error", "is_anomaly", "anomaly_score", "path"]
+                    if include_classifications:
+                        fieldnames.extend(["user_classified", "user_classification", "classification_comment", "classification_timestamp"])
+                    writer = csv.DictWriter(temp_file, fieldnames=fieldnames)
+                    writer.writeheader()
+                
+            filename = f"anomaly_export_{current_timestamp}.csv"
+            media_type = "text/csv"
+            
+        else:  # JSON format
+            import json
+            
+            # Create a temporary JSON file
+            with tempfile.NamedTemporaryFile(
+                mode="w", delete=False, suffix=".json"
+            ) as temp_file:
+                temp_file_path = temp_file.name
+                json.dump(export_data, temp_file, indent=2, default=str)
+                
+            filename = f"anomaly_export_{current_timestamp}.json"
+            media_type = "application/json"
+
+        # Return the file
+        return FileResponse(
+            path=temp_file_path,
+            filename=filename,
+            media_type=media_type,
+            background=None,  # Let FastAPI handle cleanup
+        )
+        
+    except Exception as e:
+        logger.error(f"Error exporting data: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error exporting data: {str(e)}"
         )
 
 
