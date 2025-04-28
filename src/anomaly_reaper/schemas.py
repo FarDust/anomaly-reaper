@@ -5,9 +5,9 @@ This module contains all the Pydantic models used for API request/response
 validation and serialization in the anomaly detection and classification system.
 """
 
-from pydantic import BaseModel, Field, ConfigDict
-from typing import Optional, List, Dict
+from typing import List, Optional, Dict, Any, Union, Literal
 import datetime
+from pydantic import BaseModel, Field, ConfigDict
 from enum import Enum
 
 
@@ -714,8 +714,8 @@ class AdvancedFilterResponse(BaseModel):
                     ],
                     "total_count": 150,
                     "page": 1,
-                    "page_size": 50,
-                    "total_pages": 3,
+                    "page_size": 9,
+                    "total_pages": 17,
                 }
             ]
         }
@@ -878,8 +878,8 @@ class ClassificationHistoryResponse(BaseModel):
                             "user_classification": False,
                             "comment": "After further review, this is not an anomaly",
                             "timestamp": "2025-04-26T09:12:34.567Z",
-                        }
-                    ]
+                        },
+                    ],
                 }
             ]
         }
@@ -922,9 +922,9 @@ class ExportRequest(BaseModel):
                         "is_anomaly": True,
                         "date_range": {
                             "start_date": "2025-03-25T00:00:00.000Z",
-                        }
+                        },
                     },
-                    "include_classifications": True
+                    "include_classifications": True,
                 }
             ]
         }
@@ -955,7 +955,7 @@ class SimilarAnomaliesRequest(BaseModel):
                 {
                     "image_id": "550e8400-e29b-41d4-a716-446655440000",
                     "limit": 5,
-                    "min_score": 0.7
+                    "min_score": 0.7,
                 }
             ]
         }
@@ -990,7 +990,7 @@ class SimilarityResult(BaseModel):
                         "anomaly_score": 2.3,
                         "path": "/uploads/650e8400-e29b-41d4-a716-446655440000.jpg",
                     },
-                    "similarity_score": 0.92
+                    "similarity_score": 0.92,
                 }
             ]
         }
@@ -1028,9 +1028,233 @@ class SimilarAnomaliesResponse(BaseModel):
                                 "anomaly_score": 2.3,
                                 "path": "/uploads/650e8400-e29b-41d4-a716-446655440000.jpg",
                             },
-                            "similarity_score": 0.92
+                            "similarity_score": 0.92,
                         }
-                    ]
+                    ],
+                }
+            ]
+        }
+    )
+
+
+class ImageVisualizationType(str, Enum):
+    """
+    Enum for image visualization types.
+    """
+
+    ORIGINAL = "original"
+    PROCESSED = "processed"
+    ANOMALY_HEATMAP = "anomaly_heatmap"
+    BOUNDING_BOX = "bounding_box"
+
+
+class ImageVisualizationResponse(BaseModel):
+    """
+    Pydantic model for image visualization response.
+
+    Attributes
+    ----------
+    image_id : str
+        ID of the image
+    visualization_type : ImageVisualizationType
+        Type of visualization
+    image_data : str
+        Base64-encoded image data
+    """
+
+    image_id: str
+    visualization_type: ImageVisualizationType
+    image_data: str  # Base64-encoded image
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "image_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "visualization_type": "anomaly_heatmap",
+                    "image_data": "base64_encoded_image_data...",
+                }
+            ]
+        }
+    )
+
+
+class PCAProjectionRequest(BaseModel):
+    """
+    Pydantic model for PCA projection request.
+
+    Attributes
+    ----------
+    filter : Optional[AdvancedFilterRequest]
+        Optional filter to apply before generating projection
+    highlight_anomalies : bool
+        Whether to highlight anomalies in the projection
+    use_interactive : bool
+        Whether to use interactive Plotly visualization
+    include_image_paths : bool
+        Whether to include image paths in the response data
+    """
+
+    filter: Optional[AdvancedFilterRequest] = None
+    highlight_anomalies: bool = True
+    use_interactive: bool = False
+    include_image_paths: bool = False
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "filter": {"is_anomaly": True},
+                    "highlight_anomalies": True,
+                    "use_interactive": True,
+                    "include_image_paths": False,
+                }
+            ]
+        }
+    )
+
+
+class PCAProjectionResponse(BaseModel):
+    """
+    Pydantic model for PCA projection response.
+
+    Attributes
+    ----------
+    visualization : str
+        Base64-encoded visualization image (PNG or HTML for interactive)
+    projection_data : Optional[dict]
+        Raw projection data including coordinates and metadata
+    anomaly_threshold : float
+        Threshold used for anomaly detection
+    total_points : int
+        Total number of points in the projection
+    anomaly_count : int
+        Number of anomalies in the projection
+    """
+
+    visualization: str  # Base64-encoded image or HTML
+    projection_data: Optional[Dict] = None  # Raw data for client-side visualization
+    anomaly_threshold: float
+    total_points: int
+    anomaly_count: int
+    is_interactive: bool = False
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "visualization": "base64_encoded_image_data...",
+                    "projection_data": {
+                        "points": [
+                            {"x": 0.1, "y": 0.2, "error": 0.05, "is_anomaly": False}
+                        ],
+                        "anomalies": [
+                            {"x": 0.8, "y": 0.9, "error": 0.15, "is_anomaly": True}
+                        ],
+                    },
+                    "anomaly_threshold": 0.1,
+                    "total_points": 100,
+                    "anomaly_count": 10,
+                    "is_interactive": False,
+                }
+            ]
+        }
+    )
+
+
+class AnomalyVisualizationResponse(BaseModel):
+    """
+    Pydantic model for anomaly visualization response.
+
+    Attributes
+    ----------
+    image_id : str
+        ID of the image
+    visualizations : List[ImageVisualizationResponse]
+        List of visualizations for this image
+    reconstruction_error : float
+        PCA reconstruction error for the image
+    is_anomaly : bool
+        Whether the image was classified as an anomaly
+    anomaly_score : float
+        Normalized anomaly score (0-1)
+    """
+
+    image_id: str
+    visualizations: List[ImageVisualizationResponse]
+    reconstruction_error: float
+    is_anomaly: bool
+    anomaly_score: float
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "image_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "visualizations": [
+                        {
+                            "image_id": "550e8400-e29b-41d4-a716-446655440000",
+                            "visualization_type": "original",
+                            "image_data": "base64_encoded_image_data...",
+                        },
+                        {
+                            "image_id": "550e8400-e29b-41d4-a716-446655440000",
+                            "visualization_type": "anomaly_heatmap",
+                            "image_data": "base64_encoded_image_data...",
+                        },
+                    ],
+                    "reconstruction_error": 0.15,
+                    "is_anomaly": True,
+                    "anomaly_score": 0.85,
+                }
+            ]
+        }
+    )
+
+
+class PaginatedImagesResponse(BaseModel):
+    """
+    Pydantic model for paginated images response.
+
+    Attributes
+    ----------
+    results : List[ImageResponse]
+        List of image records for the current page
+    total_count : int
+        Total number of records matching the criteria
+    page : int
+        Current page number
+    page_size : int
+        Number of results per page
+    total_pages : int
+        Total number of pages
+    """
+
+    results: List[ImageResponse]
+    total_count: int
+    page: int
+    page_size: int
+    total_pages: int
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "results": [
+                        {
+                            "id": "550e8400-e29b-41d4-a716-446655440000",
+                            "filename": "example.jpg",
+                            "timestamp": "2025-04-25T12:34:56.789Z",
+                            "reconstruction_error": 0.123,
+                            "is_anomaly": True,
+                            "anomaly_score": 2.5,
+                            "path": "/uploads/550e8400-e29b-41d4-a716-446655440000.jpg",
+                        }
+                    ],
+                    "total_count": 150,
+                    "page": 1,
+                    "page_size": 9,
+                    "total_pages": 17,
                 }
             ]
         }

@@ -234,7 +234,7 @@ def process_image(image: Union[str, Image.Image], model_dir: str) -> Dict[str, A
 
 
 def load_model(model_dir: str) -> Tuple[Any, Any, float]:
-    """Load the PCA model and scaler from the given directory.
+    """Load the PCA model and create a scaler from the given directory.
 
     Args:
         model_dir: Directory containing the model files
@@ -253,13 +253,12 @@ def load_model(model_dir: str) -> Tuple[Any, Any, float]:
             client = storage.Client(project=settings.project_id)
             bucket = client.bucket(settings.gcs_bucket_name)
 
-            # Get GCS path from environment variables
-            gcs_prefix = settings.gcs_images_prefix or ""
-            if not gcs_prefix.endswith("/"):
-                gcs_prefix += "/"
+            # Use 'anomaly_reaper/' as the base path rather than the images prefix
+            # to avoid looking in the wrong location
+            gcs_base_path = "anomaly_reaper/"
 
             # Path in GCS
-            gcs_path = f"{gcs_prefix}pca_model.pkl"
+            gcs_path = f"{gcs_base_path}pca_model.pkl"
             blob = bucket.blob(gcs_path)
 
             # Download to local temp file
@@ -275,7 +274,7 @@ def load_model(model_dir: str) -> Tuple[Any, Any, float]:
 
             # Try to get scaler from GCS too
             try:
-                gcs_scaler_path = f"{gcs_prefix}scaler.pkl"
+                gcs_scaler_path = f"{gcs_base_path}scaler.pkl"
                 blob = bucket.blob(gcs_scaler_path)
                 with tempfile.NamedTemporaryFile(delete=False) as temp:
                     blob.download_to_filename(temp.name)
@@ -285,14 +284,13 @@ def load_model(model_dir: str) -> Tuple[Any, Any, float]:
                 )
             except Exception as e:
                 logger.warning(f"Couldn't load scaler from GCS: {str(e)}")
-                # Create a basic scaler as fallback
-                from sklearn.preprocessing import StandardScaler
-
-                scaler = StandardScaler()
+                # Create a fitted scaler instead of failing
+                logger.info("Creating pre-fitted scaler instead")
+                scaler = create_prefitted_scaler()
 
             # Get threshold from GCS config if available
             try:
-                gcs_config_path = f"{gcs_prefix}config.json"
+                gcs_config_path = f"{gcs_base_path}config.json"
                 blob = bucket.blob(gcs_config_path)
                 with tempfile.NamedTemporaryFile(delete=False) as temp:
                     blob.download_to_filename(temp.name)
@@ -317,11 +315,21 @@ def load_model(model_dir: str) -> Tuple[Any, Any, float]:
         raise FileNotFoundError(f"PCA model not found at {pca_path}")
     pca_model = joblib.load(pca_path)
 
-    # Load scaler
+    # Try to load scaler from file, create one if not found
     scaler_path = os.path.join(model_dir, "scaler.pkl")
-    if not os.path.exists(scaler_path):
-        raise FileNotFoundError(f"Scaler not found at {scaler_path}")
-    scaler = joblib.load(scaler_path)
+    if os.path.exists(scaler_path):
+        try:
+            scaler = joblib.load(scaler_path)
+            logger.info(f"Loaded scaler from {scaler_path}")
+        except Exception as e:
+            logger.warning(f"Error loading scaler from {scaler_path}: {str(e)}")
+            # Create a fitted scaler as fallback
+            logger.info("Creating pre-fitted scaler instead")
+            scaler = create_prefitted_scaler()
+    else:
+        # Create a fitted scaler since we don't have one
+        logger.info(f"Scaler not found at {scaler_path}, creating pre-fitted scaler")
+        scaler = create_prefitted_scaler()
 
     # Load configuration (threshold, etc.)
     config_path = os.path.join(model_dir, "config.json")
@@ -333,3 +341,218 @@ def load_model(model_dir: str) -> Tuple[Any, Any, float]:
         threshold = 0.05  # Default threshold
 
     return pca_model, scaler, threshold
+
+
+def create_prefitted_scaler():
+    """Create a pre-fitted StandardScaler with statistics from the actual embeddings data.
+
+    Instead of loading from a scaler.pkl file, we initialize a scaler with statistics
+    calculated from the saved embeddings in the CSV file. We then save this fitted
+    scaler for future use.
+
+    Returns:
+        StandardScaler: A pre-fitted standard scaler
+    """
+    from sklearn.preprocessing import StandardScaler
+    import numpy as np
+    import pandas as pd
+    import os
+    from pathlib import Path
+
+    # First try to load an existing scaler.pkl
+    model_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+        "models",
+    )
+    scaler_path = os.path.join(model_dir, "scaler.pkl")
+
+    if os.path.exists(scaler_path):
+        try:
+            logger.info(f"Loading existing scaler from {scaler_path}")
+            scaler = joblib.load(scaler_path)
+
+            # If cloud storage is enabled, check if we need to upload the existing scaler to GCS
+            if (
+                settings.use_cloud_storage
+                and settings.project_id
+                and settings.gcs_bucket_name
+            ):
+                try:
+                    from google.cloud import storage
+
+                    # Initialize GCS client
+                    logger.info("Checking if scaler needs to be uploaded to GCS...")
+                    client = storage.Client(project=settings.project_id)
+                    bucket = client.bucket(settings.gcs_bucket_name)
+
+                    # Define the correct GCS path
+                    gcs_base_path = "anomaly_reaper/"
+                    gcs_path = f"{gcs_base_path}scaler.pkl"
+
+                    # Check if the scaler already exists in GCS
+                    blob = bucket.blob(gcs_path)
+                    if not blob.exists():
+                        logger.info(
+                            f"Scaler not found in GCS at {gcs_path}, uploading local version..."
+                        )
+                        blob.upload_from_filename(scaler_path)
+                        logger.info(
+                            f"Successfully uploaded scaler to GCS at gs://{settings.gcs_bucket_name}/{gcs_path}"
+                        )
+                    else:
+                        logger.info(
+                            f"Scaler already exists in GCS at gs://{settings.gcs_bucket_name}/{gcs_path}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to check/upload scaler to GCS: {str(e)}")
+
+            return scaler
+        except Exception as e:
+            logger.warning(f"Failed to load existing scaler: {str(e)}")
+
+    logger.info("Creating new pre-fitted scaler")
+    scaler = StandardScaler()
+
+    # Try to load the embeddings data from CSV to get real statistics
+    try:
+        # Look for embeddings file in data directory
+        data_path = Path(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        )
+
+        # Try both potential CSV file names
+        embeddings_csv = data_path / "data" / "image_embeddings.csv"
+        embeddings_df_csv = data_path / "data" / "embeddings_df.csv"
+
+        if embeddings_csv.exists():
+            logger.info(
+                f"Loading embeddings from {embeddings_csv} to create pre-fitted scaler"
+            )
+            # Load the embeddings and calculate real statistics
+            embeddings_df = pd.read_csv(embeddings_csv)
+            embeddings = embeddings_df.values
+
+            # Calculate mean and std from the real embeddings
+            scaler.mean_ = np.mean(embeddings, axis=0)
+            scaler.var_ = np.var(embeddings, axis=0)
+            scaler.scale_ = np.sqrt(scaler.var_)
+
+            # Mark as fitted with the actual dimension and sample count
+            scaler.n_features_in_ = embeddings.shape[1]
+            scaler.n_samples_seen_ = embeddings.shape[0]
+
+            logger.info(
+                f"Created pre-fitted scaler with statistics from {embeddings.shape[0]} samples of dimension {embeddings.shape[1]}"
+            )
+        elif embeddings_df_csv.exists():
+            logger.info(
+                f"Loading embeddings from {embeddings_df_csv} to create pre-fitted scaler"
+            )
+            # Try the other CSV file format
+            embeddings_df = pd.read_csv(embeddings_df_csv)
+
+            # Filter out non-numeric columns
+            numeric_cols = embeddings_df.select_dtypes(include=[np.number]).columns
+
+            if "PC1" in embeddings_df.columns and "PC2" in embeddings_df.columns:
+                logger.info(
+                    "Found PCs in embeddings_df.csv, using original embeddings if available"
+                )
+                # This is the reduced dimension data, not useful for creating a scaler
+                # Try to use image_embeddings.csv instead
+                if embeddings_csv.exists():
+                    embeddings_df = pd.read_csv(embeddings_csv)
+                    embeddings = embeddings_df.values
+                else:
+                    logger.warning("Using PC data to create scaler (not ideal)")
+                    embeddings = embeddings_df[numeric_cols].values
+            else:
+                embeddings = embeddings_df[numeric_cols].values
+
+            # Calculate mean and std from the real embeddings
+            scaler.mean_ = np.mean(embeddings, axis=0)
+            scaler.var_ = np.var(embeddings, axis=0)
+            scaler.scale_ = np.sqrt(scaler.var_)
+
+            # Mark as fitted with the actual dimension and sample count
+            scaler.n_features_in_ = embeddings.shape[1]
+            scaler.n_samples_seen_ = embeddings.shape[0]
+
+            logger.info(
+                f"Created pre-fitted scaler with statistics from {embeddings.shape[0]} samples of dimension {embeddings.shape[1]}"
+            )
+        else:
+            logger.warning(
+                f"No embeddings file found at {embeddings_csv} or {embeddings_df_csv}, using default scaler values"
+            )
+            # Fallback to default values if loading fails
+            embedding_dim = 1408  # Dimension of your image embeddings
+
+            # Initialize with reasonable default values
+            scaler.mean_ = np.zeros(embedding_dim)
+            scaler.scale_ = np.ones(embedding_dim)
+            scaler.var_ = np.ones(embedding_dim)
+
+            # Mark as fitted
+            scaler.n_features_in_ = embedding_dim
+            scaler.n_samples_seen_ = 100
+
+            logger.info(
+                f"Created default pre-fitted scaler with dimension {embedding_dim}"
+            )
+    except Exception as e:
+        logger.warning(
+            f"Error loading embeddings for scaler: {str(e)}, using default scaler values"
+        )
+        # Fallback to default values
+        embedding_dim = 1408
+        scaler.mean_ = np.zeros(embedding_dim)
+        scaler.scale_ = np.ones(embedding_dim)
+        scaler.var_ = np.ones(embedding_dim)
+        scaler.n_features_in_ = embedding_dim
+        scaler.n_samples_seen_ = 100
+
+    # Save the scaler to disk for future use
+    try:
+        os.makedirs(model_dir, exist_ok=True)
+        joblib.dump(scaler, scaler_path)
+        logger.info(f"Saved scaler to {scaler_path}")
+
+        # If we're using GCS, save it there too
+        if (
+            settings.use_cloud_storage
+            and settings.project_id
+            and settings.gcs_bucket_name
+        ):
+            try:
+                from google.cloud import storage
+
+                # Initialize GCS client
+                client = storage.Client(project=settings.project_id)
+                bucket = client.bucket(settings.gcs_bucket_name)
+
+                # Use 'anomaly_reaper/' as the base path (not the images prefix)
+                gcs_base_path = "anomaly_reaper/"
+
+                # Path in GCS
+                gcs_path = f"{gcs_base_path}scaler.pkl"
+                blob = bucket.blob(gcs_path)
+
+                # Save to a temporary file and upload
+                import tempfile
+
+                with tempfile.NamedTemporaryFile(delete=False) as temp:
+                    joblib.dump(scaler, temp.name)
+                    temp.flush()  # Ensure all data is written to disk
+                    blob.upload_from_filename(temp.name)
+                    os.unlink(temp.name)  # Clean up the temp file
+
+                logger.info(
+                    f"Uploaded scaler to GCS: gs://{settings.gcs_bucket_name}/{gcs_path}"
+                )
+            except Exception as e:
+                logger.warning(f"Couldn't save scaler to GCS: {str(e)}")
+    except Exception as e:
+        logger.warning(f"Failed to save scaler: {str(e)}")
+
+    return scaler

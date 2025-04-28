@@ -17,7 +17,7 @@ dependencies = [
     "pydantic-settings>=2.0.0",
     "typer>=0.15.2",
     "sqlalchemy>=2.0.40",
-    "psycopg2-binary>=2.9.9",  # PostgreSQL adapter
+    "psycopg2-binary>=2.9.9", # PostgreSQL adapter
     "astroquery>=0.4.10",
     "fastapi>=0.109.0",
     "uvicorn>=0.27.0",
@@ -38,6 +38,7 @@ dependencies = [
     "python-dotenv>=1.0.1",
     "vertexai>=0.1.0",
     "alembic>=1.15.2",
+    "pytest-mock>=3.14.0",
 ]
 
 [project.scripts]

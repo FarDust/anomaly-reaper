@@ -40,17 +40,17 @@ def configure_logging(level: str = "INFO") -> logging.Logger:
         level=numeric_level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-        force=True  # This ensures we reset any existing configuration
+        force=True,  # This ensures we reset any existing configuration
     )
 
     # Create a logger for our application
     logger = logging.getLogger("anomaly_reaper")
     logger.setLevel(numeric_level)
-    
+
     # Remove all existing handlers to avoid duplicates
     if logger.hasHandlers():
         logger.handlers.clear()
-    
+
     # Add a single console handler
     console_handler = logging.StreamHandler()
     console_handler.setLevel(numeric_level)
@@ -144,19 +144,25 @@ class Settings(BaseSettings):
     models_dir: str = Field(
         default_factory=lambda: os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models"
-        ) if not os.environ.get("ANOMALY_REAPER_MODELS_DIR") else os.environ.get("ANOMALY_REAPER_MODELS_DIR"),
+        )
+        if not os.environ.get("ANOMALY_REAPER_MODELS_DIR")
+        else os.environ.get("ANOMALY_REAPER_MODELS_DIR"),
         description="Directory containing PCA models",
     )
     uploads_dir: str = Field(
         default_factory=lambda: os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "uploads"
-        ) if not os.environ.get("ANOMALY_REAPER_UPLOADS_DIR") else os.environ.get("ANOMALY_REAPER_UPLOADS_DIR"),
+        )
+        if not os.environ.get("ANOMALY_REAPER_UPLOADS_DIR")
+        else os.environ.get("ANOMALY_REAPER_UPLOADS_DIR"),
         description="Directory for uploaded images",
     )
     data_dir: str = Field(
         default_factory=lambda: os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data"
-        ) if not os.environ.get("ANOMALY_REAPER_DATA_DIR") else os.environ.get("ANOMALY_REAPER_DATA_DIR"),
+        )
+        if not os.environ.get("ANOMALY_REAPER_DATA_DIR")
+        else os.environ.get("ANOMALY_REAPER_DATA_DIR"),
         description="Directory for data files",
     )
 
@@ -164,7 +170,7 @@ class Settings(BaseSettings):
     db_url: str = Field(
         "sqlite:///./anomaly_reaper.db", description="Database connection URL"
     )
-    
+
     # PostgreSQL configuration
     postgres_user: str = Field("postgres", description="PostgreSQL username")
     postgres_password: str = Field("postgres", description="PostgreSQL password")
@@ -261,18 +267,23 @@ class Settings(BaseSettings):
         for dir_name, dir_path in [
             ("models", self.models_dir),
             ("uploads", self.uploads_dir),
-            ("data", self.data_dir)
+            ("data", self.data_dir),
         ]:
             try:
                 os.makedirs(dir_path, exist_ok=True)
                 logger.info(f"Created directory: {dir_path}")
-            except PermissionError as e:
+            except PermissionError:
                 # Fall back to a temp directory if we don't have permission
                 import tempfile
-                fallback_dir = os.path.join(tempfile.gettempdir(), f"anomaly_reaper_{dir_name}")
-                logger.warning(f"Permission denied for {dir_path}, using {fallback_dir} instead")
+
+                fallback_dir = os.path.join(
+                    tempfile.gettempdir(), f"anomaly_reaper_{dir_name}"
+                )
+                logger.warning(
+                    f"Permission denied for {dir_path}, using {fallback_dir} instead"
+                )
                 os.makedirs(fallback_dir, exist_ok=True)
-                
+
                 # Update the setting to use the fallback directory
                 if dir_name == "models":
                     self.models_dir = fallback_dir
