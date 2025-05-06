@@ -301,3 +301,5 @@ $RECYCLE.BIN/
 data/**/*.fits
 data/**/*.json
 *.png
+uploads/
+models/
