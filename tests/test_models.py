@@ -185,20 +185,37 @@ class TestSQLAlchemyModels:
         db_session.add(image1)
         db_session.commit()
 
-        # Try to create another image with the same ID
-        image2 = ImageRecord(
-            id=image_id,  # Same ID as image1
-            filename="duplicate.jpg",
-            reconstruction_error=0.2,
-            is_anomaly=True,
-            anomaly_score=2.0,
-            path="/path/to/duplicate.jpg",
-        )
-        db_session.add(image2)
+        # Verify we can query the first image
+        assert db_session.query(ImageRecord).filter_by(id=image_id).first() is not None
 
-        # This should raise an IntegrityError
+        # Better approach: Use raw SQL to attempt inserting a duplicate
+        # This tests the database constraint without triggering SQLAlchemy warnings
+        from sqlalchemy import text
+
+        # This should raise an IntegrityError due to duplicate primary key
         with pytest.raises(IntegrityError):
+            # Create a raw SQL statement to insert a duplicate
+            stmt = text("""
+                INSERT INTO image_records (id, filename, reconstruction_error, is_anomaly, anomaly_score, path)
+                VALUES (:id, :filename, :recon_error, :is_anomaly, :score, :path)
+            """)
+
+            # Execute the statement directly
+            db_session.execute(
+                stmt,
+                {
+                    "id": image_id,  # Same ID as image1
+                    "filename": "duplicate.jpg",
+                    "recon_error": 0.2,
+                    "is_anomaly": True,
+                    "score": 2.0,
+                    "path": "/path/to/duplicate.jpg",
+                },
+            )
             db_session.commit()
+
+        # Rollback the failed transaction to keep the session clean
+        db_session.rollback()
 
 
 class TestPydanticModels:

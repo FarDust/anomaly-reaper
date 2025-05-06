@@ -1,6 +1,6 @@
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import uuid
@@ -9,7 +9,7 @@ import datetime
 from contextlib import asynccontextmanager
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from typing import Dict, Any, Optional, AsyncGenerator, List
+from typing import Dict, Any, Optional, AsyncGenerator
 import logging
 from tempfile import NamedTemporaryFile
 
@@ -18,6 +18,7 @@ import pandas as pd
 import tempfile
 
 # Import models and settings
+from anomaly_reaper.constants import NOT_PROCESSABLE_RECONSTRUCTION_THRESHOLD
 from anomaly_reaper.infrastructure.database.connector import query_images
 from anomaly_reaper.infrastructure.database.models import (
     get_db,
@@ -30,7 +31,6 @@ from anomaly_reaper.processing.anomaly_detection import process_image
 
 # Import GCS utilities
 from anomaly_reaper.schemas import (
-    ClassificationResponse,
     HealthCheckResponse,
     ImageResponse,
     StatisticsResponse,
@@ -38,16 +38,13 @@ from anomaly_reaper.schemas import (
     ImageClassificationResponse,
     SyncAnomalyDataResponse,
     # Add the new schemas we'll define
-    AdvancedFilterRequest,
     AdvancedFilterResponse,
     BatchClassificationRequest,
     BatchClassificationResponse,
     DashboardStatsResponse,
     # Add the new schemas for the additional endpoints
     ClassificationHistoryResponse,
-    ExportRequest,
     ExportFormat,
-    SimilarAnomaliesRequest,
     SimilarAnomaliesResponse,
     SimilarityResult,
     # Import the visualization schemas and utilities
@@ -71,6 +68,9 @@ from anomaly_reaper.utils.visualization import (
     generate_pca_projection,
     calculate_anomaly_bbox,
 )
+
+from anomaly_reaper.infrastructure.vector_database.images_store import ImagesVectorStore
+from anomaly_reaper.infrastructure.vector_database.image_embeddings import VertexAIMultimodalImageEmbeddings
 
 
 os.makedirs(settings.uploads_dir, exist_ok=True)
@@ -215,14 +215,14 @@ async def health_check() -> HealthCheckResponse:
     return HealthCheckResponse(status="ok", version="1.0.0")
 
 
-# Use plural resource name consistently for collection 
+# Use plural resource name consistently for collection
 @app.post("/images", tags=["images"])
 async def create_image(
     file: UploadFile = File(...), db: Session = Depends(get_db)
 ) -> ImageResponse:
     """
     Create a new image record by processing an uploaded image file.
-    
+
     Parameters
     ----------
     file : UploadFile
@@ -237,21 +237,21 @@ async def create_image(
         # Create a unique filename for the uploaded image
         filename = f"{uuid.uuid4()}_{file.filename}"
         local_filepath = os.path.join(settings.uploads_dir, filename)
-        
+
         # Read the file content
         contents = await file.read()
-        
+
         # Always save a local copy regardless of storage settings
         # This ensures there's always a local backup even when using GCS
         os.makedirs(os.path.dirname(local_filepath), exist_ok=True)
         with open(local_filepath, "wb") as f:
             f.write(contents)
-        
+
         logger.info(f"Saved local copy at {local_filepath}")
 
         # Determine the path to store in the database
         filepath = local_filepath
-        
+
         # If cloud storage is enabled, also upload to GCS and update the path
         if settings.use_cloud_storage:
             try:
@@ -282,34 +282,64 @@ async def create_image(
         # Process the image - always use the local path for processing
         result = process_image(local_filepath, settings.models_dir)
 
-        # Create record with the appropriate filepath (GCS or local)
-        record = ImageRecord(
-            id=str(uuid.uuid4()),
-            filename=filename,
-            path=filepath,
-            reconstruction_error=result["reconstruction_error"],
-            is_anomaly=result["is_anomaly"],
-            anomaly_score=result["anomaly_score"],
-            processed_at=datetime.datetime.now(
-                datetime.timezone.utc
-            ),  # Use actual datetime object with timezone
-        )
+        if result["reconstruction_error"] >= NOT_PROCESSABLE_RECONSTRUCTION_THRESHOLD:
+            logger.info(
+                f"Reconstruction error {result['reconstruction_error']} exceeds threshold {NOT_PROCESSABLE_RECONSTRUCTION_THRESHOLD}"
+            )
+            logger.warning(f"Image {filename} is not processable")
+            unprocessed_record = ImageResponse(
+                id="",
+                filename=filename,
+                timestamp=datetime.datetime.now(datetime.timezone.utc),
+                reconstruction_error=result["reconstruction_error"],
+                is_anomaly=result["is_anomaly"],
+                anomaly_score=result["anomaly_score"],
+                path=filepath,
+            )
+            return JSONResponse(
+                status_code=422,
+                content=unprocessed_record.model_dump(mode="json", fallback=str),
+            )
+        else:
+            logger.info(
+                f"Image {filename} processed successfully with reconstruction error {result['reconstruction_error']}"
+            )
+            logger.info(
+                f"The image is classified was accepted as {'anomaly' if result['is_anomaly'] else 'normal'}"
+            )
 
-        # Save to database
-        db.add(record)
-        db.commit()
-        db.refresh(record)
+            image_id = str(uuid.uuid4())
 
-        # Return response
-        return ImageResponse(
-            id=record.id,
-            filename=record.filename,
-            timestamp=record.processed_at,
-            reconstruction_error=record.reconstruction_error,
-            is_anomaly=record.is_anomaly,
-            anomaly_score=record.anomaly_score,
-            path=record.path,
-        )
+            logger.info(f"Storing image {image_id} to the database")
+
+            # Create record with the appropriate filepath (GCS or local)
+            record = ImageRecord(
+                id=image_id,
+                filename=filename,
+                path=filepath,
+                reconstruction_error=result["reconstruction_error"],
+                is_anomaly=result["is_anomaly"],
+                anomaly_score=result["anomaly_score"],
+                processed_at=datetime.datetime.now(
+                    datetime.timezone.utc
+                ),  # Use actual datetime object with timezone
+            )
+
+            # Save to database
+            db.add(record)
+            db.commit()
+            db.refresh(record)
+
+            # Return response
+            return ImageResponse(
+                id=record.id,
+                filename=record.filename,
+                timestamp=record.processed_at,
+                reconstruction_error=record.reconstruction_error,
+                is_anomaly=record.is_anomaly,
+                anomaly_score=record.anomaly_score,
+                path=record.path,
+            )
     except Exception as e:
         logger.error(f"Error processing image: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
@@ -318,11 +348,11 @@ async def create_image(
 # Get list of processed images
 @app.get("/images/", tags=["images"])
 async def get_images(
-    anomalies_only: bool = False, 
+    anomalies_only: bool = False,
     page: int = 1,
     page_size: int = 9,
     sort_by: str = "processed_at",
-    sort_order: str = "desc"
+    sort_order: str = "desc",
 ) -> PaginatedImagesResponse:
     """
     Get list of processed images from the database with pagination.
@@ -351,9 +381,9 @@ async def get_images(
             page=page,
             page_size=page_size,
             sort_by=sort_by,
-            sort_order=sort_order
+            sort_order=sort_order,
         )
-        
+
         # Convert to response objects
         image_responses = [
             ImageResponse(
@@ -367,7 +397,7 @@ async def get_images(
             )
             for result in results
         ]
-        
+
         # Return paginated response
         return PaginatedImagesResponse(
             results=image_responses,
@@ -397,7 +427,7 @@ async def search_images(
     page_size: int = 10,
     sort_by: str = "processed_at",
     sort_order: str = "desc",
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ) -> AdvancedFilterResponse:
     """
     Search images with filtering criteria.
@@ -470,12 +500,8 @@ async def search_images(
         # Filter by specific user classification (True/False)
         if user_classification is not None and is_classified:
             query = (
-                query.join(
-                    Classification, ImageRecord.id == Classification.image_id
-                )
-                .filter(
-                    Classification.user_classification == user_classification
-                )
+                query.join(Classification, ImageRecord.id == Classification.image_id)
+                .filter(Classification.user_classification == user_classification)
                 .distinct()
             )
 
@@ -497,9 +523,7 @@ async def search_images(
 
         # Calculate total pages
         total_pages = (
-            (total_count + page_size - 1) // page_size
-            if total_count > 0
-            else 1
+            (total_count + page_size - 1) // page_size if total_count > 0 else 1
         )
 
         # Convert to response objects
@@ -576,7 +600,7 @@ async def get_image_details(
 
 # Get image file
 @app.get("/images/{image_id}/file", tags=["images"])
-async def get_image_file(image_id: str) -> FileResponse:
+async def get_image_file(image_id: str, db: Session = Depends(get_db)) -> FileResponse:
     """
     Retrieve the image file for a specific image.
 
@@ -584,6 +608,8 @@ async def get_image_file(image_id: str) -> FileResponse:
     ----------
     image_id : str
         ID of the image to retrieve
+    db : Session
+        Database session
 
     Returns
     -------
@@ -592,49 +618,78 @@ async def get_image_file(image_id: str) -> FileResponse:
     """
     try:
         logger.info(f"Attempting to retrieve image file for ID: {image_id}")
-        
+
         # First, check if the image record exists in the database
-        db = next(get_db())
         record = db.query(ImageRecord).filter(ImageRecord.id == image_id).first()
-        
+
         if not record:
             logger.error(f"Image record with ID {image_id} not found in database")
             raise HTTPException(
                 status_code=404, detail=f"Image record with ID {image_id} not found"
             )
-        
+
         logger.info(f"Found image record: path={record.path}")
-        
-        # Get the actual image data using our improved function
-        image_data = get_image_by_id(image_id)
 
-        if not image_data:
-            logger.error(f"Could not retrieve image data for ID {image_id} from path {record.path}")
-            raise HTTPException(
-                status_code=404, detail=f"Image file with ID {image_id} not found or inaccessible"
+        # Get the file path from the record
+        file_path = record.path
+
+        # Check if the file exists
+        if is_gcs_path(file_path):
+            # Handle GCS path
+            try:
+                image_data = get_image_by_id(image_id)
+                if not image_data:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Image file with ID {image_id} not found in GCS",
+                    )
+
+                # Create a temporary file to serve
+                with NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
+                    temp_file.write(image_data["image_data"])
+                    temp_file_path = temp_file.name
+
+                return FileResponse(
+                    path=temp_file_path,
+                    filename=os.path.basename(file_path),
+                    media_type=image_data["content_type"],
+                    background=None,  # Let FastAPI handle cleanup
+                )
+            except Exception as e:
+                logger.error(f"Error retrieving file from GCS: {str(e)}")
+                raise HTTPException(
+                    status_code=500, detail=f"Error retrieving file from GCS: {str(e)}"
+                )
+        else:
+            # Handle local path
+            if not os.path.exists(file_path):
+                # Try alternative locations
+                file_name = os.path.basename(file_path)
+                alternative_path = os.path.join(settings.uploads_dir, file_name)
+
+                if os.path.exists(alternative_path):
+                    file_path = alternative_path
+                else:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Image file with ID {image_id} not found at {file_path}",
+                    )
+
+            # Determine content type
+            content_type = get_content_type_from_filename(file_path)
+
+            # Return the file
+            return FileResponse(
+                path=file_path,
+                filename=os.path.basename(file_path),
+                media_type=content_type,
             )
-            
-        logger.info(f"Successfully retrieved image data for ID {image_id}, content type: {image_data['content_type']}")
-
-        # Create a temporary file to serve
-        with NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
-            temp_file.write(image_data["image_data"])
-            temp_file_path = temp_file.name
-            
-        logger.info(f"Created temporary file at {temp_file_path}")
-
-        return FileResponse(
-            path=temp_file_path,
-            headers={"Content-Disposition": f"inline; filename={image_id}.jpg"},
-            media_type=image_data["content_type"],
-        )
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Unexpected error serving image file: {str(e)}", exc_info=True)
         raise HTTPException(
-            status_code=500, 
-            detail=f"Error serving image file: {str(e)}"
+            status_code=500, detail=f"Error serving image file: {str(e)}"
         )
 
 
@@ -704,6 +759,12 @@ async def batch_update_classifications(
         is_anomaly = request.is_anomaly
         comment = request.comment
 
+        # Validate that image_ids is not empty
+        if not image_ids:
+            raise HTTPException(
+                status_code=422, detail="Image IDs list cannot be empty"
+            )
+
         # Track results
         successful_count = 0
         failed_ids = []
@@ -747,6 +808,8 @@ async def batch_update_classifications(
             failed_ids=failed_ids,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in batch classification: {str(e)}")
         raise HTTPException(
@@ -777,7 +840,9 @@ async def api_statistics() -> StatisticsResponse:
 
 # Get dashboard statistics
 @app.get("/statistics/dashboard", tags=["statistics"])
-async def get_dashboard_statistics(db: Session = Depends(get_db)) -> DashboardStatsResponse:
+async def get_dashboard_statistics(
+    db: Session = Depends(get_db),
+) -> DashboardStatsResponse:
     """
     Get comprehensive statistics for dashboard visualization.
 
@@ -789,14 +854,14 @@ async def get_dashboard_statistics(db: Session = Depends(get_db)) -> DashboardSt
     try:
         # Get total number of images
         total_images = db.query(func.count(ImageRecord.id)).scalar()
-        
+
         # Get number of anomalies detected by the model
         total_anomalies = (
             db.query(func.count(ImageRecord.id))
             .filter(ImageRecord.is_anomaly == True)  # noqa: E712
             .scalar()
         )
-        
+
         # Get number of user-confirmed anomalies
         # These are images marked as anomalies by the model that users also classified as anomalies
         user_confirmed_anomalies = (
@@ -807,12 +872,12 @@ async def get_dashboard_statistics(db: Session = Depends(get_db)) -> DashboardSt
             .distinct()
             .scalar()
         )
-        
+
         # Get number of unclassified anomalies
         # These are images marked as anomalies by the model that have not been classified by users yet
         # First find all classified image IDs
         classified_image_ids = db.query(Classification.image_id).distinct().subquery()
-        
+
         # Then count anomalous images that aren't in the classified set
         unclassified_anomalies = (
             db.query(func.count(ImageRecord.id))
@@ -820,7 +885,7 @@ async def get_dashboard_statistics(db: Session = Depends(get_db)) -> DashboardSt
             .filter(~ImageRecord.id.in_(classified_image_ids))
             .scalar()
         )
-        
+
         # Get false positives
         # These are images marked as anomalies by the model but classified as normal by users
         false_positives = (
@@ -831,7 +896,7 @@ async def get_dashboard_statistics(db: Session = Depends(get_db)) -> DashboardSt
             .distinct()
             .scalar()
         )
-        
+
         # Get false negatives
         # These are images marked as normal by the model but classified as anomalies by users
         false_negatives = (
@@ -842,7 +907,7 @@ async def get_dashboard_statistics(db: Session = Depends(get_db)) -> DashboardSt
             .distinct()
             .scalar()
         )
-        
+
         # Get recent activity (10 most recent classifications)
         recent_activity_records = (
             db.query(Classification)
@@ -850,13 +915,15 @@ async def get_dashboard_statistics(db: Session = Depends(get_db)) -> DashboardSt
             .limit(10)
             .all()
         )
-        
+
         # Format the activity for the response
         recent_activity = []
         for record in recent_activity_records:
             # Get the image details
-            image = db.query(ImageRecord).filter(ImageRecord.id == record.image_id).first()
-            
+            image = (
+                db.query(ImageRecord).filter(ImageRecord.id == record.image_id).first()
+            )
+
             activity_item = {
                 "timestamp": record.timestamp,
                 "image_id": record.image_id,
@@ -864,10 +931,12 @@ async def get_dashboard_statistics(db: Session = Depends(get_db)) -> DashboardSt
                 "is_anomaly": record.user_classification,
                 "comment": record.comment,
                 "model_prediction": image.is_anomaly if image else None,
-                "anomaly_score": float(image.anomaly_score) if image and image.anomaly_score is not None else None,
+                "anomaly_score": float(image.anomaly_score)
+                if image and image.anomaly_score is not None
+                else None,
             }
             recent_activity.append(activity_item)
-        
+
         # Return the dashboard statistics
         return DashboardStatsResponse(
             total_images=total_images,
@@ -908,7 +977,7 @@ def get_image_by_id(image_id: str) -> Optional[Dict[str, Any]]:
         if not record or not record.path:
             logger.error(f"No record found for image ID {image_id} or path is empty")
             return None
-        
+
         logger.info(f"Found image record: id={image_id}, path={record.path}")
 
         # Extract the filename from the path
@@ -929,9 +998,9 @@ def get_image_by_id(image_id: str) -> Optional[Dict[str, Any]]:
                 logger.warning(
                     f"GCS path found ({record.path}) but cloud storage is disabled. Trying to find local copy."
                 )
-            
+
             # Try local fallbacks:
-            
+
             # 1. First check in uploads directory
             local_path = os.path.join(settings.uploads_dir, filename)
             if os.path.exists(local_path):
@@ -942,75 +1011,86 @@ def get_image_by_id(image_id: str) -> Optional[Dict[str, Any]]:
                 # Determine content type based on file extension
                 content_type = get_content_type_from_filename(local_path)
                 return {"image_data": image_data, "content_type": content_type}
-                
+
             # 2. Check in data directory for astronomical images (FITS files, etc.)
             potential_data_paths = []
-            
+
             # Specifically check the data/s0027/cam1-ccd1 directory for TESS images
             tess_data_dir = os.path.join(settings.data_dir, "s0027", "cam1-ccd1")
             if os.path.exists(tess_data_dir):
                 for root, _, files in os.walk(tess_data_dir):
                     for file in files:
-                        if filename in file:  # If filename is part of any file in the TESS data directory
+                        if (
+                            filename in file
+                        ):  # If filename is part of any file in the TESS data directory
                             potential_data_paths.append(os.path.join(root, file))
-            
+
             # 3. Search all of data directory recursively for the exact filename
             for root, _, files in os.walk(settings.data_dir):
                 if filename in files:
                     found_path = os.path.join(root, filename)
                     logger.info(f"Found image in data directory: {found_path}")
                     potential_data_paths.append(found_path)
-            
+
             # Use the first found path
             if potential_data_paths:
                 found_path = potential_data_paths[0]
                 logger.info(f"Using found image at: {found_path}")
                 with open(found_path, "rb") as f:
                     image_data = f.read()
-                
+
                 content_type = get_content_type_from_filename(found_path)
                 return {"image_data": image_data, "content_type": content_type}
-            
+
             # 4. If still not found, try to download from the GCS URL directly
             # even though GCS integration is disabled
             try:
-                logger.info(f"Attempting to download from GCS URL directly: {record.path}")
+                logger.info(
+                    f"Attempting to download from GCS URL directly: {record.path}"
+                )
                 # Extract bucket and blob path from gs:// URL
                 gcs_path = record.path.replace("gs://", "")
                 parts = gcs_path.split("/", 1)
                 if len(parts) < 2:
                     logger.error(f"Invalid GCS path format: {record.path}")
                     return None
-                
+
                 bucket_name = parts[0]
                 blob_path = parts[1]
-                
+
                 # Create a public HTTP URL
                 http_url = f"https://storage.googleapis.com/{bucket_name}/{blob_path}"
-                
+
                 # Download using requests
                 import requests
+
                 logger.info(f"Attempting to download from public URL: {http_url}")
                 response = requests.get(http_url, timeout=10)
-                
+
                 if response.status_code == 200:
                     # Save a local copy for future use
                     local_save_path = os.path.join(settings.uploads_dir, filename)
                     os.makedirs(os.path.dirname(local_save_path), exist_ok=True)
-                    
+
                     with open(local_save_path, "wb") as f:
                         f.write(response.content)
-                    
-                    logger.info(f"Successfully downloaded and saved image to {local_save_path}")
+
+                    logger.info(
+                        f"Successfully downloaded and saved image to {local_save_path}"
+                    )
                     return {
-                        "image_data": response.content, 
-                        "content_type": response.headers.get("Content-Type", get_content_type_from_filename(filename))
+                        "image_data": response.content,
+                        "content_type": response.headers.get(
+                            "Content-Type", get_content_type_from_filename(filename)
+                        ),
                     }
                 else:
-                    logger.error(f"Failed to download from public URL. Status code: {response.status_code}")
+                    logger.error(
+                        f"Failed to download from public URL. Status code: {response.status_code}"
+                    )
             except Exception as e:
                 logger.error(f"Error downloading from public URL: {str(e)}")
-            
+
             logger.error(
                 f"Cannot find local copy for GCS image with path {record.path}"
             )
@@ -1019,8 +1099,10 @@ def get_image_by_id(image_id: str) -> Optional[Dict[str, Any]]:
             # Handle local file path
             # If the path doesn't exist as is, try to find it
             if not os.path.exists(record.path):
-                logger.warning(f"Image file not found at path: {record.path}. Trying alternative locations.")
-                
+                logger.warning(
+                    f"Image file not found at path: {record.path}. Trying alternative locations."
+                )
+
                 # Try finding the file in uploads directory
                 upload_path = os.path.join(settings.uploads_dir, filename)
                 if os.path.exists(upload_path):
@@ -1029,7 +1111,7 @@ def get_image_by_id(image_id: str) -> Optional[Dict[str, Any]]:
                         image_data = f.read()
                     content_type = get_content_type_from_filename(upload_path)
                     return {"image_data": image_data, "content_type": content_type}
-                
+
                 # Try recursively searching the data directory for the file
                 for root, _, files in os.walk(settings.data_dir):
                     if filename in files:
@@ -1039,7 +1121,7 @@ def get_image_by_id(image_id: str) -> Optional[Dict[str, Any]]:
                             image_data = f.read()
                         content_type = get_content_type_from_filename(found_path)
                         return {"image_data": image_data, "content_type": content_type}
-                
+
                 logger.error(f"Image file not found in any location: {filename}")
                 return None
 
@@ -1059,12 +1141,12 @@ def get_image_by_id(image_id: str) -> Optional[Dict[str, Any]]:
 def get_content_type_from_filename(filepath: str) -> str:
     """
     Determine content type based on file extension.
-    
+
     Parameters
     ----------
     filepath : str
         Path to the file
-        
+
     Returns
     -------
     str
@@ -1500,7 +1582,7 @@ async def get_similar_images(
     image_id: str,
     limit: int = 10,
     min_score: float = 0.5,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ) -> SimilarAnomaliesResponse:
     """
     Find images with similar anomaly patterns to a reference image.
@@ -1529,91 +1611,116 @@ async def get_similar_images(
                 status_code=404, detail=f"Reference image with ID {image_id} not found"
             )
 
-        # Find potential similar images
-        # First, get images with similar anomaly characteristics (score and error)
-        # Focus on images that were detected as anomalies
-        query = (
-            db.query(ImageRecord)
-            .filter(ImageRecord.id != image_id)  # Exclude reference image
-            .filter(ImageRecord.is_anomaly == True)  # noqa: E712
-        )
-
-        # Get all potential matches
-        potential_matches = query.all()
-
-        # Calculate similarity scores based on a combination of factors
-        similarity_results = []
-        for image in potential_matches:
-            # Calculate score based on similarity in anomaly score and reconstruction error
-            # Convert to numeric values to ensure we can do math with them
-            ref_score = (
-                float(reference_image.anomaly_score)
-                if reference_image.anomaly_score is not None
-                else 0.0
+        # Get the image data for the reference image
+        reference_image_data = get_image_by_id(image_id)
+        if not reference_image_data:
+            raise HTTPException(
+                status_code=404, detail=f"Image file with ID {image_id} not found"
             )
-            img_score = (
-                float(image.anomaly_score) if image.anomaly_score is not None else 0.0
+            
+        
+        # Create a temporary file from the reference image data for embedding
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+            temp_file.write(reference_image_data["image_data"])
+            reference_temp_path = temp_file.name
+        
+        try:
+            # Initialize the vertex AI embedding model
+            embedding_model = VertexAIMultimodalImageEmbeddings()
+            
+            # Get all anomalous images (excluding the reference image)
+            query = (
+                db.query(ImageRecord)
+                .filter(ImageRecord.id != image_id)  # Exclude reference image
+                .filter(ImageRecord.is_anomaly == True)  # noqa: E712
             )
-
-            ref_error = (
-                float(reference_image.reconstruction_error)
-                if reference_image.reconstruction_error is not None
-                else 0.0
-            )
-            img_error = (
-                float(image.reconstruction_error)
-                if image.reconstruction_error is not None
-                else 0.0
-            )
-
-            # Score based on how close these values are (inversely proportional to difference)
-            score_diff = abs(ref_score - img_score)
-            error_diff = abs(ref_error - img_error)
-
-            # Normalize differences relative to the reference values to get values between 0-1
-            # (where 1 is most similar)
-            max_score_diff = max(ref_score, 1.0)  # Avoid division by zero
-            max_error_diff = max(ref_error, 1.0)  # Avoid division by zero
-
-            normalized_score_similarity = 1.0 - min(score_diff / max_score_diff, 1.0)
-            normalized_error_similarity = 1.0 - min(error_diff / max_error_diff, 1.0)
-
-            # Combine the similarity scores (equal weight to both factors)
-            combined_similarity = (
-                normalized_score_similarity + normalized_error_similarity
-            ) / 2
-
-            # Only include if above minimum score threshold
-            if combined_similarity >= min_score:
-                similarity_results.append(
-                    {"image": image, "similarity_score": combined_similarity}
+            
+            # Get all potential matches
+            potential_matches = query.all()
+            
+            # Create list of image paths and metadata for vector store
+            image_paths = []
+            metadatas = []
+            
+            for image in potential_matches:
+                image_data = get_image_by_id(image.id)
+                if image_data:
+                    # Create a temporary file for this image
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as img_temp_file:
+                        img_temp_file.write(image_data["image_data"])
+                        image_paths.append(img_temp_file.name)
+                        
+                        # Store metadata with each image
+                        metadatas.append({
+                            "id": image.id,
+                            "filename": image.filename,
+                            "timestamp": image.processed_at,
+                            "reconstruction_error": image.reconstruction_error,
+                            "is_anomaly": image.is_anomaly,
+                            "anomaly_score": image.anomaly_score,
+                            "path": image.path
+                        })
+            
+            # If we have potential matches, perform vector similarity search
+            if image_paths:
+                # Create vector store from the images
+                vector_store = ImagesVectorStore.from_texts(
+                    texts=image_paths,
+                    embedding=embedding_model,
+                    metadatas=metadatas
                 )
-
-        # Sort by similarity score (highest first) and limit results
-        similarity_results.sort(key=lambda x: x["similarity_score"], reverse=True)
-        limited_results = similarity_results[: limit]
-
-        # Convert to response objects
-        response_results = [
-            SimilarityResult(
-                image=ImageResponse(
-                    id=result["image"].id,
-                    filename=result["image"].filename,
-                    timestamp=result["image"].processed_at,
-                    reconstruction_error=result["image"].reconstruction_error,
-                    is_anomaly=result["image"].is_anomaly,
-                    anomaly_score=result["image"].anomaly_score,
-                    path=result["image"].path,
-                ),
-                similarity_score=result["similarity_score"],
+                
+                # Perform similarity search using vector embeddings
+                search_results = vector_store.similarity_search_by_vector_with_score(
+                    embedding=embedding_model.embed_query(reference_temp_path),
+                    k=limit
+                )
+                
+                # Convert results to response format
+                response_results = []
+                for doc, score in search_results:
+                    if score >= min_score:
+                        metadata = doc.metadata
+                        response_results.append(
+                            SimilarityResult(
+                                image=ImageResponse(
+                                    id=metadata["id"],
+                                    filename=metadata["filename"],
+                                    timestamp=metadata["timestamp"],
+                                    reconstruction_error=metadata["reconstruction_error"],
+                                    is_anomaly=metadata["is_anomaly"],
+                                    anomaly_score=metadata["anomaly_score"],
+                                    path=metadata["path"],
+                                ),
+                                similarity_score=score,
+                            )
+                        )
+            else:
+                # No potential matches found
+                response_results = []
+                
+            # Clean up temporary files
+            try:
+                os.unlink(reference_temp_path)
+                for path in image_paths:
+                    if os.path.exists(path):
+                        os.unlink(path)
+            except Exception as e:
+                logger.warning(f"Error cleaning up temporary files: {str(e)}")
+                
+            # Return the results
+            return SimilarAnomaliesResponse(
+                reference_image_id=image_id, similar_images=response_results
             )
-            for result in limited_results
-        ]
-
-        # Return the results
-        return SimilarAnomaliesResponse(
-            reference_image_id=image_id, similar_images=response_results
-        )
+            
+        finally:
+            # Ensure cleanup of temporary files
+            try:
+                if os.path.exists(reference_temp_path):
+                    os.unlink(reference_temp_path)
+            except Exception as e:
+                logger.warning(f"Error cleaning up reference image temporary file: {str(e)}")
+            
     except HTTPException:
         raise
     except Exception as e:
@@ -1630,7 +1737,7 @@ async def create_pca_visualization(
 ) -> PCAProjectionResponse:
     """
     Create a PCA projection visualization of images.
-    
+
     Parameters
     ----------
     request : PCAProjectionRequest, optional
@@ -1748,7 +1855,7 @@ async def export_images(
     include_classifications: bool = True,
     sort_by: Optional[str] = None,
     sort_order: str = "desc",
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ) -> FileResponse:
     """
     Export image data in CSV or JSON format with optional filtering.
@@ -1820,12 +1927,8 @@ async def export_images(
         # Filter by specific user classification (True/False)
         if user_classification is not None and is_classified:
             query = (
-                query.join(
-                    Classification, ImageRecord.id == Classification.image_id
-                )
-                .filter(
-                    Classification.user_classification == user_classification
-                )
+                query.join(Classification, ImageRecord.id == Classification.image_id)
+                .filter(Classification.user_classification == user_classification)
                 .distinct()
             )
 
@@ -1853,9 +1956,13 @@ async def export_images(
                 "id": record.id,
                 "filename": record.filename,
                 "timestamp": record.processed_at.isoformat(),
-                "reconstruction_error": float(record.reconstruction_error) if record.reconstruction_error is not None else None,
+                "reconstruction_error": float(record.reconstruction_error)
+                if record.reconstruction_error is not None
+                else None,
                 "is_anomaly": bool(record.is_anomaly),
-                "anomaly_score": float(record.anomaly_score) if record.anomaly_score is not None else None,
+                "anomaly_score": float(record.anomaly_score)
+                if record.anomaly_score is not None
+                else None,
                 "path": record.path,
             }
 
@@ -1871,9 +1978,13 @@ async def export_images(
 
                 if classification:
                     image_data["user_classified"] = True
-                    image_data["user_classification"] = bool(classification.user_classification)
+                    image_data["user_classification"] = bool(
+                        classification.user_classification
+                    )
                     image_data["classification_comment"] = classification.comment
-                    image_data["classification_timestamp"] = classification.timestamp.isoformat()
+                    image_data["classification_timestamp"] = (
+                        classification.timestamp.isoformat()
+                    )
                 else:
                     image_data["user_classified"] = False
                     image_data["user_classification"] = None
@@ -1884,16 +1995,16 @@ async def export_images(
 
         # Create a file in the requested format
         current_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        
+
         if format == ExportFormat.CSV:
             import csv
-            
+
             # Create a temporary CSV file
             with tempfile.NamedTemporaryFile(
                 mode="w", delete=False, suffix=".csv", newline=""
             ) as temp_file:
                 temp_file_path = temp_file.name
-                
+
                 # Determine field names - use first record as template
                 if export_data:
                     fieldnames = export_data[0].keys()
@@ -1902,25 +2013,40 @@ async def export_images(
                     writer.writerows(export_data)
                 else:
                     # No data, just create empty file with headers
-                    fieldnames = ["id", "filename", "timestamp", "reconstruction_error", "is_anomaly", "anomaly_score", "path"]
+                    fieldnames = [
+                        "id",
+                        "filename",
+                        "timestamp",
+                        "reconstruction_error",
+                        "is_anomaly",
+                        "anomaly_score",
+                        "path",
+                    ]
                     if include_classifications:
-                        fieldnames.extend(["user_classified", "user_classification", "classification_comment", "classification_timestamp"])
+                        fieldnames.extend(
+                            [
+                                "user_classified",
+                                "user_classification",
+                                "classification_comment",
+                                "classification_timestamp",
+                            ]
+                        )
                     writer = csv.DictWriter(temp_file, fieldnames=fieldnames)
                     writer.writeheader()
-                
+
             filename = f"anomaly_export_{current_timestamp}.csv"
             media_type = "text/csv"
-            
+
         else:  # JSON format
             import json
-            
+
             # Create a temporary JSON file
             with tempfile.NamedTemporaryFile(
                 mode="w", delete=False, suffix=".json"
             ) as temp_file:
                 temp_file_path = temp_file.name
                 json.dump(export_data, temp_file, indent=2, default=str)
-                
+
             filename = f"anomaly_export_{current_timestamp}.json"
             media_type = "application/json"
 
@@ -1931,12 +2057,96 @@ async def export_images(
             media_type=media_type,
             background=None,  # Let FastAPI handle cleanup
         )
-        
+
     except Exception as e:
         logger.error(f"Error exporting data: {str(e)}")
-        raise HTTPException(
-            status_code=500, detail=f"Error exporting data: {str(e)}"
+        raise HTTPException(status_code=500, detail=f"Error exporting data: {str(e)}")
+
+
+# Get classification history for a specific image
+@app.get("/images/{image_id}/classifications", tags=["classifications"])
+async def get_classification_history(
+    image_id: str, db: Session = Depends(get_db)
+) -> ClassificationHistoryResponse:
+    """
+    Get classification history for a specific image.
+
+    This endpoint returns all user classifications made for a specific image,
+    ordered by timestamp (most recent first).
+
+    Parameters
+    ----------
+    image_id : str
+        The ID of the image to get classification history for
+
+    Returns
+    -------
+    ClassificationHistoryResponse
+        Classification history for the image
+    """
+    try:
+        # Verify the image exists
+        image = db.query(ImageRecord).filter(ImageRecord.id == image_id).first()
+        if not image:
+            raise HTTPException(
+                status_code=404, detail=f"Image with ID {image_id} not found"
+            )
+
+        # Get all classifications for this image, ordered by timestamp (newest first)
+        classifications = (
+            db.query(Classification)
+            .filter(Classification.image_id == image_id)
+            .order_by(Classification.timestamp.desc())
+            .all()
         )
+
+        # Convert to response objects
+        classification_responses = [
+            {
+                "id": classification.id,
+                "timestamp": classification.timestamp.isoformat()
+                if hasattr(classification.timestamp, "isoformat")
+                else classification.timestamp,
+                "user_classification": classification.user_classification,
+                "comment": classification.comment,
+            }
+            for classification in classifications
+        ]
+
+        # Return the classification history
+        return ClassificationHistoryResponse(
+            image_id=image_id, classifications=classification_responses
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving classification history: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error retrieving classification history: {str(e)}"
+        )
+
+
+def image_to_dict(image: ImageRecord) -> dict:
+    """Convert an ImageRecord model instance to a dictionary.
+
+    Parameters
+    ----------
+    image : ImageRecord
+        The image record to convert
+
+    Returns
+    -------
+    dict
+        Dictionary representation of the image
+    """
+    return {
+        "id": image.id,
+        "filename": image.filename,
+        "anomaly_score": image.anomaly_score,
+        "is_anomaly": image.is_anomaly,
+        "reconstruction_error": image.reconstruction_error,
+        "timestamp": image.processed_at.isoformat() if image.processed_at else None,
+    }
 
 
 typer_app = Typer(
