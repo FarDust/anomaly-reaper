@@ -172,3 +172,16 @@ jobs:
           
           echo "Health check failed after $MAX_RETRIES attempts"
           exit 1
+          
+      # Create GitHub deployment
+      - name: Create GitHub deployment
+        uses: bobheadxi/deployments@v1
+        if: success()
+        with:
+          step: finish
+          token: ${{ secrets.GITHUB_TOKEN }}
+          env: production
+          deployment_id: ${{ steps.deploy.outputs.name }}
+          override: true
+          env_url: ${{ steps.deploy.outputs.url }}
+          description: 'Successfully deployed to Cloud Run'
