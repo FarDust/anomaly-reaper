@@ -31,6 +31,7 @@ RUN uv venv /app/.venv \
 
 # Copy source code
 COPY src/ ./src/
+COPY README.md ./README.md
 
 # Expose the port that the app will run on
 EXPOSE 8000
