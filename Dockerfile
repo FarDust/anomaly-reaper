@@ -22,6 +22,9 @@ RUN pip install uv
 # Copy project files
 COPY pyproject.toml uv.lock ./
 
+# Copy source code
+COPY src/ ./src/
+COPY README.md ./README.md
 
 # Create and activate virtual environment, then install dependencies
 RUN uv venv /app/.venv \
@@ -29,13 +32,9 @@ RUN uv venv /app/.venv \
     && uv pip install --system ".[dev,test]" \
     && uv pip install --system "psycopg2-binary"
 
-# Copy source code
-COPY src/ ./src/
-COPY README.md ./README.md
-
 # Expose the port that the app will run on
-EXPOSE 8000
+EXPOSE 8080
 
 # Set the entry point
-ENTRYPOINT ["python", "-m", "anomaly_reaper"]
-CMD ["run"]
+ENTRYPOINT ["anomaly-reaper-api"]
+CMD ["run", "--port", "8080"]
