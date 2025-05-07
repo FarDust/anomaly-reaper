@@ -39,13 +39,14 @@ dependencies = [
     "vertexai>=0.1.0",
     "alembic>=1.15.2",
     "pytest-mock>=3.14.0",
+    "setuptools>=70.0.0",
 ]
 
 [project.scripts]
 anomaly-reaper-api = "anomaly_reaper.interfaces.api:typer_app"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "setuptools>=70.0.0"]
 build-backend = "hatchling.build"
 
 [dependency-groups]
