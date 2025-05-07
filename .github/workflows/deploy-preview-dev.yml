@@ -3,8 +3,8 @@ name: Development Preview Deployment
 on:
   push:
     branches:
-      - develop # Assuming you use a develop branch
-  workflow_dispatch: # Allow manual triggering
+      - develop 
+  workflow_dispatch:
 
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
@@ -16,6 +16,7 @@ jobs:
   build-and-deploy-preview:
     name: Build and Deploy Preview
     runs-on: ubuntu-latest
+    environment: dev
     
     permissions:
       contents: 'read'
@@ -23,19 +24,23 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       # Configure Workload Identity Federation
       - id: 'auth'
         name: 'Authenticate to Google Cloud'
-        uses: 'google-github-actions/auth@v1'
+        uses: 'google-github-actions/auth@v2'
         with:
           workload_identity_provider: '${{ secrets.WIF_PROVIDER }}'
           service_account: '${{ secrets.WIF_SERVICE_ACCOUNT }}'
+          token_format: 'access_token'
 
-      # Set up Google Cloud SDK
+      # Set up Google Cloud SDK with recommended minimum version for WIF
       - name: 'Set up Cloud SDK'
-        uses: 'google-github-actions/setup-gcloud@v1'
+        uses: 'google-github-actions/setup-gcloud@v2'
+        with:
+          version: '>= 363.0.0'
+          project_id: ${{ env.PROJECT_ID }}
 
       # Build and push the Docker image
       - name: Build and Push Container
@@ -53,12 +58,36 @@ jobs:
       # Deploy to Cloud Run (development environment)
       - name: Deploy to Cloud Run (Dev)
         id: deploy
-        uses: google-github-actions/deploy-cloudrun@v1
+        uses: google-github-actions/deploy-cloudrun@v2
         with:
           service: ${{ env.SERVICE_NAME }}
           region: ${{ env.REGION }}
           image: ${{ env.IMAGE_NAME }}
-          flags: '--allow-unauthenticated --set-env-vars=ENVIRONMENT=develop --service-account=${{ secrets.CLOUDRUN_SERVICE_ACCOUNT }}'
+          env_vars: |-
+            ENVIRONMENT=develop
+            ANOMALY_REAPER_APP_NAME=Anomaly Reaper Dev
+            ANOMALY_REAPER_HOST=0.0.0.0
+            ANOMALY_REAPER_PORT=8080
+            ANOMALY_REAPER_LOG_LEVEL=info
+            ANOMALY_REAPER_MODELS_DIR=/tmp/models
+            ANOMALY_REAPER_UPLOADS_DIR=/tmp/uploads
+            ANOMALY_REAPER_DATA_DIR=/tmp/data
+            ANOMALY_REAPER_ANOMALY_THRESHOLD=0.05
+            ANOMALY_REAPER_PROJECT_ID=${{ env.PROJECT_ID }}
+            ANOMALY_REAPER_LOCATION=${{ env.REGION }}
+            ANOMALY_REAPER_GCS_BUCKET_NAME=${{ secrets.GCS_BUCKET_NAME }}
+            ANOMALY_REAPER_GCS_IMAGES_PREFIX=anomaly_reaper/images
+            ANOMALY_REAPER_GCS_USE_PUBLIC_URLS=False
+            ANOMALY_REAPER_USE_CLOUD_STORAGE=True
+          secrets: |-
+            ANOMALY_REAPER_DB_URL=anomaly-reaper-db-url-dev:latest
+          flags: |
+            --cpu=1
+            --memory=1Gi
+            --min-instances=0
+            --max-instances=1
+            --timeout=300s
+            --service-account=${{ secrets.CLOUDRUN_SERVICE_ACCOUNT }}
 
       # Output the development URL
       - name: Show Development URL

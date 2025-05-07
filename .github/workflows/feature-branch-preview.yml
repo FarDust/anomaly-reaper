@@ -18,6 +18,7 @@ jobs:
     if: github.event_name == 'pull_request' && github.event.pull_request.merged != true
     name: Deploy Feature Preview
     runs-on: ubuntu-latest
+    environment: feature
     
     permissions:
       contents: 'read'
@@ -26,7 +27,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       # Create a unique service name based on PR number
       - name: Set Service Name
@@ -37,14 +38,18 @@ jobs:
       # Configure Workload Identity Federation
       - id: 'auth'
         name: 'Authenticate to Google Cloud'
-        uses: 'google-github-actions/auth@v1'
+        uses: 'google-github-actions/auth@v2'
         with:
           workload_identity_provider: '${{ secrets.WIF_PROVIDER }}'
           service_account: '${{ secrets.WIF_SERVICE_ACCOUNT }}'
+          token_format: 'access_token'
 
-      # Set up Google Cloud SDK
+      # Set up Google Cloud SDK with recommended minimum version for WIF
       - name: 'Set up Cloud SDK'
-        uses: 'google-github-actions/setup-gcloud@v1'
+        uses: 'google-github-actions/setup-gcloud@v2'
+        with:
+          version: '>= 363.0.0'
+          project_id: ${{ env.PROJECT_ID }}
 
       # Build and push the Docker image
       - name: Build and Push Container
@@ -62,12 +67,36 @@ jobs:
       # Deploy to Cloud Run
       - name: Deploy to Cloud Run
         id: deploy
-        uses: google-github-actions/deploy-cloudrun@v1
+        uses: google-github-actions/deploy-cloudrun@v2
         with:
           service: ${{ env.SERVICE_NAME }}
           region: ${{ env.REGION }}
           image: ${{ env.IMAGE_NAME }}
-          flags: '--allow-unauthenticated --set-env-vars=ENVIRONMENT=feature --service-account=${{ secrets.CLOUDRUN_SERVICE_ACCOUNT }}'
+          env_vars: |-
+            ENVIRONMENT=feature
+            ANOMALY_REAPER_APP_NAME=Anomaly Reaper Feature
+            ANOMALY_REAPER_HOST=0.0.0.0
+            ANOMALY_REAPER_PORT=8080
+            ANOMALY_REAPER_LOG_LEVEL=info
+            ANOMALY_REAPER_MODELS_DIR=/tmp/models
+            ANOMALY_REAPER_UPLOADS_DIR=/tmp/uploads
+            ANOMALY_REAPER_DATA_DIR=/tmp/data
+            ANOMALY_REAPER_ANOMALY_THRESHOLD=0.05
+            ANOMALY_REAPER_PROJECT_ID=${{ env.PROJECT_ID }}
+            ANOMALY_REAPER_LOCATION=${{ env.REGION }}
+            ANOMALY_REAPER_GCS_BUCKET_NAME=${{ secrets.GCS_BUCKET_NAME }}
+            ANOMALY_REAPER_GCS_IMAGES_PREFIX=anomaly_reaper/images/feature-${{ github.event.pull_request.number }}
+            ANOMALY_REAPER_GCS_USE_PUBLIC_URLS=False
+            ANOMALY_REAPER_USE_CLOUD_STORAGE=True
+          secrets: |-
+            ANOMALY_REAPER_DB_URL=anomaly-reaper-db-url-feature:latest
+          flags: |
+            --cpu=1
+            --memory=1Gi
+            --min-instances=0
+            --max-instances=1
+            --timeout=300s
+            --service-account=${{ secrets.CLOUDRUN_SERVICE_ACCOUNT }}
 
       # Health Check
       - name: Health Check
@@ -119,14 +148,17 @@ jobs:
       # Configure Workload Identity Federation
       - id: 'auth'
         name: 'Authenticate to Google Cloud'
-        uses: 'google-github-actions/auth@v1'
+        uses: 'google-github-actions/auth@v2'
         with:
           workload_identity_provider: '${{ secrets.WIF_PROVIDER }}'
           service_account: '${{ secrets.WIF_SERVICE_ACCOUNT }}'
 
-      # Set up Google Cloud SDK
+      # Set up Google Cloud SDK with recommended minimum version
       - name: 'Set up Cloud SDK'
-        uses: 'google-github-actions/setup-gcloud@v1'
+        uses: 'google-github-actions/setup-gcloud@v2'
+        with:
+          version: '>= 363.0.0'
+          project_id: ${{ env.PROJECT_ID }}
 
       # Delete the Cloud Run service
       - name: Delete Cloud Run Service

@@ -29,7 +29,7 @@ COPY README.md ./README.md
 # Create and activate virtual environment, then install dependencies
 RUN uv venv /app/.venv \
     && . /app/.venv/bin/activate \
-    && uv pip install --system ".[dev,test]" \
+    && uv pip install --system "." \
     && uv pip install --system "psycopg2-binary"
 
 # Expose the port that the app will run on
@@ -37,4 +37,4 @@ EXPOSE 8080
 
 # Set the entry point
 ENTRYPOINT ["anomaly-reaper-api"]
-CMD ["run", "--port", "8080"]
+CMD ["--port", "8080", "--host", "0.0.0.0"]

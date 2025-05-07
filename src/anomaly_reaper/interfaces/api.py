@@ -2153,7 +2153,7 @@ typer_app = Typer(
     name=settings.app_name,
     help="Command-line interface for Anomaly Reaper",
     add_completion=False,
-    no_args_is_help=True,
+    no_args_is_help=False,
 )
 
 
