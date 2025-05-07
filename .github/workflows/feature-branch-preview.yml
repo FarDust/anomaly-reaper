@@ -8,7 +8,8 @@ on:
 
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-  REGION: us-west1
+  REGION: ${{ secrets.GCP_REGION }}
+  DOCKER_REPO: brainwave
   BASE_SERVICE_NAME: anomaly-reaper-feature
 
 jobs:
