@@ -8,7 +8,7 @@ on:
 
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-  REGION: us-west1
+  REGION: ${{ secrets.GCP_REGION }}
   BASE_SERVICE_NAME: anomaly-reaper-feature
 
 jobs:
@@ -66,7 +66,7 @@ jobs:
           service: ${{ env.SERVICE_NAME }}
           region: ${{ env.REGION }}
           image: ${{ env.IMAGE_NAME }}
-          flags: '--allow-unauthenticated --set-env-vars=ENVIRONMENT=feature'
+          flags: '--allow-unauthenticated --set-env-vars=ENVIRONMENT=feature --service-account=${{ secrets.CLOUDRUN_SERVICE_ACCOUNT }}'
 
       # Health Check
       - name: Health Check

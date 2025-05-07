@@ -9,7 +9,7 @@ on:
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   SERVICE_NAME: anomaly-reaper
-  REGION: us-west1 # Change to your preferred region
+  REGION: ${{ secrets.GCP_REGION }}
   REPOSITORY: anomaly-reaper # Artifact Registry repository name
 
 jobs:
@@ -157,4 +157,3 @@ jobs:
           
           echo "Health check failed after $MAX_RETRIES attempts"
           exit 1
-      
