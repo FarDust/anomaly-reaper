@@ -10,7 +10,7 @@ env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   SERVICE_NAME: anomaly-reaper
   REGION: ${{ secrets.GCP_REGION }}
-  REPOSITORY: anomaly-reaper # Artifact Registry repository name
+  REPOSITORY: brainwave
 
 jobs:
   build-and-deploy:
