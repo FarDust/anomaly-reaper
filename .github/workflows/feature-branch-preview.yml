@@ -51,7 +51,7 @@ jobs:
         run: |-
           gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
           
-          DOCKER_REPOSITORY="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/anomaly-reaper"
+          DOCKER_REPOSITORY="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.DOCKER_REPO }}"
           IMAGE_NAME="${DOCKER_REPOSITORY}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
           
           docker build -t "${IMAGE_NAME}" .
