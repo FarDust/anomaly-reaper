@@ -15,8 +15,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
 )
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, sessionmaker, Session
+from sqlalchemy.orm import relationship, sessionmaker, Session, declarative_base
 from typing import Generator
 import datetime
 
@@ -24,7 +23,14 @@ import datetime
 from anomaly_reaper.config import settings
 
 # Database setup
-engine = create_engine(settings.db_url)
+engine = create_engine(
+    settings.db_url,
+    pool_size=20,
+    max_overflow=20,
+    pool_timeout=60,
+    pool_recycle=360,
+    pool_pre_ping=True,
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

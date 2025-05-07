@@ -12,7 +12,7 @@ import logging
 from typing import Optional
 
 
-def configure_logging(level: str = "INFO") -> None:
+def configure_logging(level: str = "INFO") -> logging.Logger:
     """
     Configure logging for the application.
 
@@ -20,6 +20,11 @@ def configure_logging(level: str = "INFO") -> None:
     ----------
     level : str
         Logging level (debug, info, warning, error, critical)
+
+    Returns
+    -------
+    logging.Logger
+        Configured logger instance
 
     Examples
     --------
@@ -30,28 +35,31 @@ def configure_logging(level: str = "INFO") -> None:
     if not isinstance(numeric_level, int):
         numeric_level = logging.INFO
 
-    # Configure the root logger
+    # Configure the root logger only once
     logging.basicConfig(
         level=numeric_level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,  # This ensures we reset any existing configuration
     )
 
     # Create a logger for our application
     logger = logging.getLogger("anomaly_reaper")
     logger.setLevel(numeric_level)
 
-    # Avoid duplicate handlers
-    if not logger.handlers:
-        # Create console handler
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(numeric_level)
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
+    # Remove all existing handlers to avoid duplicates
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    # Add a single console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(numeric_level)
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
     # Log startup message
     logger.info(f"Logging configured with level: {level}")
@@ -99,6 +107,12 @@ class Settings(BaseSettings):
         Path to GCP service account credentials file
     use_cloud_storage : bool
         Whether to use GCS for image storage instead of local files
+    postgres_user : str
+        PostgreSQL username
+    postgres_password : str
+        PostgreSQL password
+    postgres_db : str
+        PostgreSQL database name
 
     Examples
     --------
@@ -126,23 +140,29 @@ class Settings(BaseSettings):
     port: int = Field(8000, description="Port to bind the server to")
     log_level: str = Field("info", description="Logging level")
 
-    # Directory paths
+    # Directory paths - use local paths for development, Docker paths for production
     models_dir: str = Field(
         default_factory=lambda: os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models"
-        ),
+        )
+        if not os.environ.get("ANOMALY_REAPER_MODELS_DIR")
+        else os.environ.get("ANOMALY_REAPER_MODELS_DIR"),
         description="Directory containing PCA models",
     )
     uploads_dir: str = Field(
         default_factory=lambda: os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "images"
-        ),
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "uploads"
+        )
+        if not os.environ.get("ANOMALY_REAPER_UPLOADS_DIR")
+        else os.environ.get("ANOMALY_REAPER_UPLOADS_DIR"),
         description="Directory for uploaded images",
     )
     data_dir: str = Field(
         default_factory=lambda: os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data"
-        ),
+        )
+        if not os.environ.get("ANOMALY_REAPER_DATA_DIR")
+        else os.environ.get("ANOMALY_REAPER_DATA_DIR"),
         description="Directory for data files",
     )
 
@@ -150,6 +170,11 @@ class Settings(BaseSettings):
     db_url: str = Field(
         "sqlite:///./anomaly_reaper.db", description="Database connection URL"
     )
+
+    # PostgreSQL configuration
+    postgres_user: str = Field("postgres", description="PostgreSQL username")
+    postgres_password: str = Field("postgres", description="PostgreSQL password")
+    postgres_db: str = Field("anomaly_reaper", description="PostgreSQL database name")
 
     # Model configuration
     anomaly_threshold: float = Field(
@@ -231,6 +256,7 @@ class Settings(BaseSettings):
         Create necessary directories for the application.
 
         Creates the models and uploads directories if they don't exist.
+        Handles permission errors gracefully by falling back to temporary directories.
 
         Examples
         --------
@@ -238,12 +264,33 @@ class Settings(BaseSettings):
         >>> settings.create_directories()
         # Creates the models and uploads directories
         """
-        os.makedirs(self.models_dir, exist_ok=True)
-        os.makedirs(self.uploads_dir, exist_ok=True)
-        os.makedirs(self.data_dir, exist_ok=True)
-        logger.info(
-            f"Created directories: {self.models_dir}, {self.uploads_dir}, {self.data_dir}"
-        )
+        for dir_name, dir_path in [
+            ("models", self.models_dir),
+            ("uploads", self.uploads_dir),
+            ("data", self.data_dir),
+        ]:
+            try:
+                os.makedirs(dir_path, exist_ok=True)
+                logger.info(f"Created directory: {dir_path}")
+            except PermissionError:
+                # Fall back to a temp directory if we don't have permission
+                import tempfile
+
+                fallback_dir = os.path.join(
+                    tempfile.gettempdir(), f"anomaly_reaper_{dir_name}"
+                )
+                logger.warning(
+                    f"Permission denied for {dir_path}, using {fallback_dir} instead"
+                )
+                os.makedirs(fallback_dir, exist_ok=True)
+
+                # Update the setting to use the fallback directory
+                if dir_name == "models":
+                    self.models_dir = fallback_dir
+                elif dir_name == "uploads":
+                    self.uploads_dir = fallback_dir
+                elif dir_name == "data":
+                    self.data_dir = fallback_dir
 
     model_config = {
         "env_file": ".env",

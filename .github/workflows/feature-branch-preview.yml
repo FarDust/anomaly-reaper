@@ -1,0 +1,180 @@
+name: Feature Branch Preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_target:
+    types: [closed]
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: ${{ secrets.GCP_REGION }}
+  DOCKER_REPO: brainwave
+  BASE_SERVICE_NAME: anomaly-reaper-feature
+
+jobs:
+  # Deploy feature branch preview
+  deploy-feature-preview:
+    if: github.event_name == 'pull_request' && github.event.pull_request.merged != true
+    name: Deploy Feature Preview
+    runs-on: ubuntu-latest
+    environment: feature
+    
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Create a unique service name based on PR number
+      - name: Set Service Name
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          echo "SERVICE_NAME=${BASE_SERVICE_NAME}-pr-${PR_NUMBER}" >> $GITHUB_ENV
+      
+      # Configure Workload Identity Federation
+      - id: 'auth'
+        name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v2'
+        with:
+          workload_identity_provider: '${{ secrets.WIF_PROVIDER }}'
+          service_account: '${{ secrets.WIF_SERVICE_ACCOUNT }}'
+          token_format: 'access_token'
+
+      # Set up Google Cloud SDK with recommended minimum version for WIF
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v2'
+        with:
+          version: '>= 363.0.0'
+          project_id: ${{ env.PROJECT_ID }}
+
+      # Build and push the Docker image
+      - name: Build and Push Container
+        run: |-
+          gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
+          
+          DOCKER_REPOSITORY="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.DOCKER_REPO }}"
+          IMAGE_NAME="${DOCKER_REPOSITORY}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
+          
+          docker build -t "${IMAGE_NAME}" .
+          docker push "${IMAGE_NAME}"
+          
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
+
+      # Deploy to Cloud Run
+      - name: Deploy to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.SERVICE_NAME }}
+          region: ${{ env.REGION }}
+          image: ${{ env.IMAGE_NAME }}
+          env_vars: |-
+            ENVIRONMENT=feature
+            ANOMALY_REAPER_APP_NAME=Anomaly Reaper Feature
+            ANOMALY_REAPER_HOST=0.0.0.0
+            ANOMALY_REAPER_PORT=8080
+            ANOMALY_REAPER_LOG_LEVEL=info
+            ANOMALY_REAPER_MODELS_DIR=/tmp/models
+            ANOMALY_REAPER_UPLOADS_DIR=/tmp/uploads
+            ANOMALY_REAPER_DATA_DIR=/tmp/data
+            ANOMALY_REAPER_ANOMALY_THRESHOLD=0.05
+            ANOMALY_REAPER_PROJECT_ID=${{ env.PROJECT_ID }}
+            ANOMALY_REAPER_LOCATION=${{ env.REGION }}
+            ANOMALY_REAPER_GCS_BUCKET_NAME=${{ secrets.GCS_BUCKET_NAME }}
+            ANOMALY_REAPER_GCS_IMAGES_PREFIX=anomaly_reaper/images/feature-${{ github.event.pull_request.number }}
+            ANOMALY_REAPER_GCS_USE_PUBLIC_URLS=False
+            ANOMALY_REAPER_USE_CLOUD_STORAGE=True
+          secrets: |-
+            ANOMALY_REAPER_DB_URL=anomaly-reaper-db-url-feature:latest
+          flags: |
+            --cpu=1
+            --memory=1Gi
+            --min-instances=0
+            --max-instances=1
+            --timeout=300s
+            --service-account=${{ secrets.CLOUDRUN_SERVICE_ACCOUNT }}
+
+      # Health Check
+      - name: Health Check
+        id: health-check
+        run: |
+          sleep 30
+          SERVICE_URL="${{ steps.deploy.outputs.url }}"
+          echo "Performing health check on ${SERVICE_URL}/health"
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "${SERVICE_URL}/health")
+          
+          if [ "$RESPONSE" -eq 200 ]; then
+            echo "Health check passed with HTTP 200"
+          else
+            echo "Health check failed with HTTP ${RESPONSE}"
+            exit 1
+          fi
+
+      # Add comment to PR with the preview URL
+      - name: Comment on PR
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const serviceUrl = '${{ steps.deploy.outputs.url }}';
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `✅ Feature preview deployed successfully!\n\n📱 Preview URL: [${serviceUrl}](${serviceUrl})\n\n🔍 Health check endpoint: [${serviceUrl}/health](${serviceUrl}/health)\n\n_This preview environment will be automatically deleted when this PR is merged or closed._`
+            })
+
+  # Cleanup feature branch preview after PR is merged or closed
+  cleanup-feature-preview:
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true || (github.event_name == 'pull_request_target' && github.event.action == 'closed')
+    name: Cleanup Feature Preview
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+      pull-requests: write
+
+    steps:
+      - name: Set Service Name
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          echo "SERVICE_NAME=${BASE_SERVICE_NAME}-pr-${PR_NUMBER}" >> $GITHUB_ENV
+      
+      # Configure Workload Identity Federation
+      - id: 'auth'
+        name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v2'
+        with:
+          workload_identity_provider: '${{ secrets.WIF_PROVIDER }}'
+          service_account: '${{ secrets.WIF_SERVICE_ACCOUNT }}'
+
+      # Set up Google Cloud SDK with recommended minimum version
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v2'
+        with:
+          version: '>= 363.0.0'
+          project_id: ${{ env.PROJECT_ID }}
+
+      # Delete the Cloud Run service
+      - name: Delete Cloud Run Service
+        run: |
+          echo "Deleting feature preview: ${{ env.SERVICE_NAME }}"
+          gcloud run services delete ${{ env.SERVICE_NAME }} --region=${{ env.REGION }} --quiet || true
+
+      # Add comment to PR about cleanup
+      - name: Comment on PR
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🧹 Feature preview environment for PR #${{ github.event.pull_request.number }} has been cleaned up and deleted.`
+            })

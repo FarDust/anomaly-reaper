@@ -1,0 +1,174 @@
+name: Build and Deploy to Cloud Run
+
+on:
+  push:
+    branches:
+      - main # Set a branch name to trigger deployment
+  workflow_dispatch: # Allow manual triggering of the workflow
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  SERVICE_NAME: anomaly-reaper
+  REGION: ${{ secrets.GCP_REGION }}
+  REPOSITORY: brainwave
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    environment: prod
+    
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4 # Updated to v4
+        with:
+          fetch-depth: 0 # Fetch all history for proper versioning
+
+      # Configure Workload Identity Federation and generate access token
+      - id: 'auth'
+        name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v2' # Updated to v2
+        with:
+          workload_identity_provider: '${{ secrets.WIF_PROVIDER }}'
+          service_account: '${{ secrets.WIF_SERVICE_ACCOUNT }}'
+          token_format: 'access_token'
+
+      # Set up Google Cloud SDK with recommended minimum version for WIF
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v2'
+        with:
+          version: '>= 390.0.0' # Using 390.0.0+ for better bq and gsutil compatibility with WIF
+          project_id: ${{ env.PROJECT_ID }}
+
+      # Set up Docker Buildx for efficient builds
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Setup Docker Layer Caching
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      # Configure Docker to use gcloud as a credential helper
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      # Extract short SHA for tagging
+      - name: Extract Short SHA
+        run: echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      # Generate version tag based on git history
+      - name: Generate Version
+        run: |
+          VERSION=$(git describe --tags --always --dirty || echo $(date +%Y%m%d)-$(git rev-parse --short HEAD))
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      # Build and push the Docker image to Google Artifact Registry
+      - name: Build and Push Container
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ github.sha }}
+            ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ env.VERSION }}
+            ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:latest
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+          build-args: |
+            VERSION=${{ env.VERSION }}
+
+      # Move cache to prevent cache bloat
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      # Scan container for vulnerabilities
+      - name: Scan for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ github.sha }}
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+          timeout: '10m'
+
+      # Set up image name for deployment
+      - name: Set Image Name
+        run: echo "IMAGE_NAME=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}:${{ github.sha }}" >> $GITHUB_ENV
+
+      # Deploy to Cloud Run with improved settings
+      - name: Deploy to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.SERVICE_NAME }}
+          region: ${{ env.REGION }}
+          image: ${{ env.IMAGE_NAME }}
+          env_vars: |-
+            ENVIRONMENT=prod
+            ANOMALY_REAPER_APP_NAME=Anomaly Reaper
+            ANOMALY_REAPER_HOST=0.0.0.0
+            ANOMALY_REAPER_PORT=8080
+            ANOMALY_REAPER_LOG_LEVEL=info
+            ANOMALY_REAPER_MODELS_DIR=/tmp/models
+            ANOMALY_REAPER_UPLOADS_DIR=/tmp/uploads
+            ANOMALY_REAPER_DATA_DIR=/tmp/data
+            ANOMALY_REAPER_ANOMALY_THRESHOLD=0.05
+            ANOMALY_REAPER_PROJECT_ID=${{ env.PROJECT_ID }}
+            ANOMALY_REAPER_LOCATION=${{ env.REGION }}
+            ANOMALY_REAPER_GCS_BUCKET_NAME=${{ secrets.GCS_BUCKET_NAME }}
+            ANOMALY_REAPER_GCS_IMAGES_PREFIX=anomaly_reaper/images
+            ANOMALY_REAPER_GCS_USE_PUBLIC_URLS=False
+            ANOMALY_REAPER_USE_CLOUD_STORAGE=True
+          secrets: |-
+            ANOMALY_REAPER_DB_URL=anomaly-reaper-db-url:latest
+          flags: |
+            --cpu=1
+            --memory=1Gi
+            --min-instances=0
+            --max-instances=1
+            --timeout=300s
+            --service-account=${{ secrets.CLOUDRUN_SERVICE_ACCOUNT }}
+
+      # Output the deployed service URL
+      - name: Show Service URL
+        run: echo "Service URL ${{ steps.deploy.outputs.url }}"
+      
+      # Improved health check with retries
+      - name: Health Check
+        id: health-check
+        run: |
+          SERVICE_URL="${{ steps.deploy.outputs.url }}"
+          HEALTH_ENDPOINT="/health"
+          MAX_RETRIES=10
+          RETRY_INTERVAL=15
+          
+          echo "Performing health check on ${SERVICE_URL}${HEALTH_ENDPOINT}"
+          
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Attempt $i of $MAX_RETRIES..."
+            RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "${SERVICE_URL}${HEALTH_ENDPOINT}")
+            
+            if [ "$RESPONSE" -eq 200 ]; then
+              echo "Health check passed with HTTP 200"
+              exit 0
+            else
+              echo "Health check returned HTTP ${RESPONSE}, retrying in ${RETRY_INTERVAL} seconds..."
+              sleep $RETRY_INTERVAL
+            fi
+          done
+          
+          echo "Health check failed after $MAX_RETRIES attempts"
+          exit 1
