@@ -10,6 +10,7 @@ env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   SERVICE_NAME: anomaly-reaper-dev
   REGION: us-west1
+  DOCKER_REPO: brainwave
   
 jobs:
   build-and-deploy-preview:
@@ -41,7 +42,7 @@ jobs:
         run: |-
           gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
           
-          DOCKER_REPOSITORY="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/anomaly-reaper"
+          DOCKER_REPOSITORY="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.DOCKER_REPO }}"
           IMAGE_NAME="${DOCKER_REPOSITORY}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
           
           docker build -t "${IMAGE_NAME}" .
